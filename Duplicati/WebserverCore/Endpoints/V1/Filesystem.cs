@@ -48,6 +48,14 @@ public class Filesystem : IEndpointV1
         if (string.IsNullOrEmpty(path))
             throw new BadRequestException("No path was found");
 
+        if (!OperatingSystem.IsWindows() && (path == "~" || path.StartsWith("~/", StringComparison.Ordinal)))
+        {
+            var home = Environment.GetEnvironmentVariable("HOME");
+            if (string.IsNullOrWhiteSpace(home))
+                home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            path = path == "~" ? home : Path.Combine(home, path.Substring(2));
+        }
+
         path = SpecialFolders.ExpandEnvironmentVariables(path);
 
         if (!OperatingSystem.IsWindows() && !path.StartsWith("/", StringComparison.Ordinal))
@@ -243,7 +251,17 @@ public class Filesystem : IEndpointV1
     private static IEnumerable<Dto.TreeNodeDto> ListFolderAsNodes(string entrypath, bool skipFiles, bool showHidden)
     {
         //Helper function for finding out if a folder has sub elements
-        Func<string, bool> hasSubElements = (p) => skipFiles ? Directory.EnumerateDirectories(p).Any() : Directory.EnumerateFileSystemEntries(p).Any();
+        Func<string, bool> hasSubElements = (p) =>
+        {
+            try
+            {
+                return skipFiles ? Directory.EnumerateDirectories(p).Any() : Directory.EnumerateFileSystemEntries(p).Any();
+            }
+            catch
+            {
+                return false;
+            }
+        };
 
         //Helper function for dealing with exceptions when accessing off-limits folders
         Func<string, bool> isEmptyFolder = (p) =>
@@ -261,6 +279,23 @@ public class Filesystem : IEndpointV1
             return false;
         };
 
+        IEnumerable<string> entries;
+        try
+        {
+            entries = SystemIO.IO_OS.EnumerateFileSystemEntries(entrypath);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or DirectoryNotFoundException or IOException)
+        {
+            Library.Logging.Log.WriteWarningMessage(LOGTAG, "ListFolderFailed", ex, $"Cannot access folder: {entrypath}");
+            yield break;
+        }
+
+        FileAttributes safeGetAttributes(string p)
+        {
+            try { return SystemIO.IO_OS.GetFileAttributes(p); }
+            catch { return FileAttributes.Normal; }
+        }
+
         Func<string, long> getFileSize = (p) =>
         {
             try { return new FileInfo(p).Length; }
@@ -268,16 +303,16 @@ public class Filesystem : IEndpointV1
             return -1;
         };
 
-        foreach (var s in SystemIO.IO_OS.EnumerateFileSystemEntries(entrypath)
+        foreach (var s in entries
             // Group directories first
-            .OrderByDescending(f => SystemIO.IO_OS.GetFileAttributes(f) & FileAttributes.Directory)
+            .OrderByDescending(f => safeGetAttributes(f) & FileAttributes.Directory)
             // Sort both groups (directories and files) alphabetically
             .ThenBy(f => f))
         {
             Dto.TreeNodeDto? tn = null;
             try
             {
-                var attr = SystemIO.IO_OS.GetFileAttributes(s);
+                var attr = safeGetAttributes(s);
                 var isSymlink = SystemIO.IO_OS.IsSymlink(s, attr);
                 var isFolder = attr.HasFlag(FileAttributes.Directory);
                 var isFile = !isFolder;

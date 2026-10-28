@@ -2334,7 +2334,7 @@ msgstr "端口"
 
 #: templates/settings.html:30
 msgid "Prevent tray icon automatic log-in"
-msgstr "保持托盘图标自动登录"
+msgstr "禁止托盘图标自动登录"
 
 #: templates/addoredit.html:114 templates/addoredit.html:247
 #: templates/addoredit.html:297 templates/addoredit.html:411
