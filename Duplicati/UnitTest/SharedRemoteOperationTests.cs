@@ -37,6 +37,46 @@ public class SharedRemoteOperationTests : BasicSetupHelper
         return (string?)method!.Invoke(null, new object?[] { url, additionalPath });
     }
 
+    private static string UnmaskUrl(Server.Database.Connection connection, string maskedurl, string? backupId, long connectionStringId, string? prefix)
+    {
+        var method = typeof(WebserverCore.Endpoints.Shared.SharedRemoteOperation)
+            .GetMethod("UnmaskUrl", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.IsNotNull(method, "UnmaskUrl not found via reflection");
+        return (string)method!.Invoke(null, new object?[] { connection, maskedurl, backupId, connectionStringId, prefix })!;
+    }
+
+    [Test]
+    [Category("RemoteOperation")]
+    public async System.Threading.Tasks.Task UnmaskUrlWithConnectionStringIdRestoresPassword()
+    {
+        using var tempFolder = new Library.Utility.TempFolder();
+        var dbPath = System.IO.Path.Combine(tempFolder, "duplicati.sqlite");
+        var sqliteCon = await Library.SQLiteHelper.SQLiteLoader.LoadConnectionAsync(dbPath);
+        Library.SQLiteHelper.DatabaseUpgrader.UpgradeDatabase(sqliteCon, dbPath, typeof(Library.RestAPI.Database.DatabaseSchemaMarker));
+        using var connection = new Server.Database.Connection(sqliteCon, true, null, tempFolder, () => { });
+
+        var cs = new Server.Database.ConnectionString
+        {
+            Name = "My WebDAV",
+            Description = "Test",
+            BaseUrl = "webdav://192.168.31.46:5244/dav/?auth-username=admin&auth-password=realSecretPassword"
+        };
+        connection.AddConnectionString(cs);
+        var addedId = cs.ID;
+
+        var maskedUrl = $"webdav://192.168.31.46:5244/dav/subfolder/?auth-username=admin&auth-password={Server.Database.Connection.PASSWORD_PLACEHOLDER}";
+
+        // 1. Unmask via explicit connectionStringId
+        var unmasked = UnmaskUrl(connection, maskedUrl, null, addedId, null);
+        Assert.IsTrue(unmasked.Contains("auth-password=realSecretPassword"));
+        Assert.IsFalse(unmasked.Contains(Server.Database.Connection.PASSWORD_PLACEHOLDER));
+
+        // 2. Unmask via fallback search when connectionStringId is 0 or null
+        var unmaskedFallback = UnmaskUrl(connection, maskedUrl, null, 0, null);
+        Assert.IsTrue(unmaskedFallback.Contains("auth-password=realSecretPassword"));
+        Assert.IsFalse(unmaskedFallback.Contains(Server.Database.Connection.PASSWORD_PLACEHOLDER));
+    }
+
     [Test]
     [Category("RemoteOperation")]
     public void AppendAdditionalPathKeepsNonStandardSchemesIntact()

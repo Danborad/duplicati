@@ -178,22 +178,84 @@ public class SharedRemoteOperation
     /// <returns>The unmasked URL</returns>
     private static string UnmaskUrl(Connection connection, string maskedurl, string? backupId, long connectionStringId, string? prefix)
     {
-        var backup = !string.IsNullOrWhiteSpace(backupId) ? connection.GetBackup(backupId) : null;
-        var previousUrl = backup?.TargetURL;
+        var candidates = new List<string>();
 
-        if (string.IsNullOrWhiteSpace(previousUrl) && connectionStringId > 0)
-            previousUrl = connection.GetConnectionString(connectionStringId)?.BaseUrl;
-
-        if (!string.IsNullOrWhiteSpace(prefix) && backup?.Sources != null)
+        // 1. If an explicit connectionStringId was supplied, it is the most direct source of truth
+        if (connectionStringId > 0)
         {
-            previousUrl = backup.Sources?.FirstOrDefault(s => s.StartsWith(prefix + '|', StringComparison.Ordinal));
-            if (!string.IsNullOrWhiteSpace(previousUrl))
-                previousUrl = previousUrl.Split('|', 2).LastOrDefault();
+            var csUrl = connection.GetConnectionString(connectionStringId)?.BaseUrl;
+            if (!string.IsNullOrWhiteSpace(csUrl))
+                candidates.Add(csUrl);
         }
 
-        var unmasked = string.IsNullOrWhiteSpace(previousUrl)
+        // 2. If a backupId was supplied, collect the backup's TargetURL, AdditionalTargetURLs, and connection strings
+        var backup = !string.IsNullOrWhiteSpace(backupId) ? connection.GetBackup(backupId) : null;
+        if (backup != null)
+        {
+            if (!string.IsNullOrWhiteSpace(backup.TargetURL))
+                candidates.Add(backup.TargetURL);
+
+            if (backup.AdditionalTargetURLs != null)
+            {
+                foreach (var t in backup.AdditionalTargetURLs)
+                {
+                    if (!string.IsNullOrWhiteSpace(t.TargetUrl))
+                        candidates.Add(t.TargetUrl);
+                }
+            }
+
+            if (backup.ConnectionStringID > 0)
+            {
+                var csUrl = connection.GetConnectionString(backup.ConnectionStringID)?.BaseUrl;
+                if (!string.IsNullOrWhiteSpace(csUrl))
+                    candidates.Add(csUrl);
+            }
+
+            if (!string.IsNullOrWhiteSpace(prefix) && backup.Sources != null)
+            {
+                var src = backup.Sources.FirstOrDefault(s => s.StartsWith(prefix + '|', StringComparison.Ordinal));
+                if (!string.IsNullOrWhiteSpace(src))
+                {
+                    var u = src.Split('|', 2).LastOrDefault();
+                    if (!string.IsNullOrWhiteSpace(u))
+                        candidates.Add(u);
+                }
+            }
+        }
+
+        // 3. Fallback: if the URL still contains a password placeholder and was not unmasked,
+        // search all saved connection strings matching the same scheme and host
+        if (Connection.UrlContainsPasswordPlaceholder(maskedurl))
+        {
+            var allCs = connection.GetConnectionStrings();
+            if (allCs != null && allCs.Length > 0)
+            {
+                try
+                {
+                    var maskedUri = new Library.Utility.RelaxedUri(maskedurl);
+                    foreach (var cs in allCs)
+                    {
+                        if (string.IsNullOrWhiteSpace(cs.BaseUrl) || Connection.UrlContainsPasswordPlaceholder(cs.BaseUrl))
+                            continue;
+                        try
+                        {
+                            var csUri = new Library.Utility.RelaxedUri(cs.BaseUrl);
+                            if (string.Equals(csUri.Scheme, maskedUri.Scheme, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(csUri.Host, maskedUri.Host, StringComparison.OrdinalIgnoreCase))
+                            {
+                                candidates.Add(cs.BaseUrl);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        var unmasked = candidates.Count == 0
             ? maskedurl
-            : QuerystringMasking.Unmask(maskedurl, previousUrl);
+            : QuerystringMasking.Unmask(maskedurl, candidates);
 
         if (Connection.UrlContainsPasswordPlaceholder(unmasked))
             throw new ArgumentException("Unmasked URL contains password placeholder");
