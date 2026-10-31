@@ -1,0 +1,1 @@
+var e=i=>{if(!i||typeof i!=`string`||i.length===0)return{size:0,unit:`MB`};let t=i.match(/^(\d+)(bytes|kb|mb|gb|tb|pb|b|kib|mib|gib|tib|pib)$/i);return t&&(t[2].toUpperCase()===`B`||t[2].toUpperCase()===`BYTES`)?{size:1,unit:`KB`}:{size:t?parseInt(t[1],10):0,unit:t?t[2].toUpperCase():`MB`}};export{e as t};

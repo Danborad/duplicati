@@ -1635,7 +1635,10 @@ namespace Duplicati.Server
                 RegisterRestoreTestNotification(databaseConnection, backup, backupResults.RestoreTestResults);
 
             if (!backup.IsTemporary)
+            {
                 databaseConnection.SetMetadata(backup.Metadata, long.Parse(backup.ID), null);
+                WebhookNotificationSender.DispatchTaskCompletion(databaseConnection, backup, result);
+            }
 
             notificationUpdateService.IncrementLastDataUpdateId();
             eventPollNotify.SignalNewEvent();

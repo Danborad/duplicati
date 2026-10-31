@@ -1,0 +1,1 @@
+var t=[{path:``,loadComponent:()=>import(`./chunk-CAvqpodp.js`),children:[{path:``,redirectTo:`stored`,pathMatch:`full`},{path:`stored`,loadComponent:()=>import(`./chunk-DHvQ-KZn.js`)},{path:`live`,loadComponent:()=>import(`./chunk-DwRfdR9t.js`)}]}];export{t as default};
