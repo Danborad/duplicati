@@ -100,6 +100,10 @@ partial class BackendManager
         /// </summary>
         public required Func<Task>? IndexVolumeFinishedCallback { get; init; }
         /// <summary>
+        /// The optional source file modification time in UTC to preserve on the destination
+        /// </summary>
+        public DateTime? LastModificationUtc { get; init; }
+        /// <summary>
         /// The default callback for database updates (no-op)
         /// </summary>
         public static Func<Task> OnDbUpdateDefault = () => Task.CompletedTask;
@@ -303,6 +307,18 @@ partial class BackendManager
                 }
                 else
                     await backend.PutAsync(effectiveName, LocalFilename, cancelToken).ConfigureAwait(false);
+
+                if (LastModificationUtc.HasValue && backend is ISetTimestampBackend timestampBackend)
+                {
+                    try
+                    {
+                        await timestampBackend.SetLastWriteTimeUtcAsync(effectiveName, LastModificationUtc.Value, cancelToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logging.Log.WriteVerboseMessage(LOGTAG, "FailedToSetRemoteTimestamp", "Failed to set remote timestamp on {0}: {1}", effectiveName, ex.Message);
+                    }
+                }
             }
             finally
             {

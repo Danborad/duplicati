@@ -32,7 +32,7 @@ namespace Duplicati.Library.Backend
     /// <summary>
     /// The file backend implementation
     /// </summary>
-    public class File : IBackend, IStreamingBackend, IQuotaEnabledBackend, IRenameEnabledBackend, IFolderEnabledBackend
+    public class File : IBackend, IStreamingBackend, IQuotaEnabledBackend, IRenameEnabledBackend, IFolderEnabledBackend, ISetTimestampBackend
     {
         /// <summary>
         /// The option key for the destination marker file
@@ -446,6 +446,16 @@ namespace Duplicati.Library.Backend
                 else
                 {
                     systemIO.FileCopy(sourceFilePath, targetFilePath, true);
+                    if (systemIO.FileExists(sourceFilePath))
+                    {
+                        try
+                        {
+                            systemIO.FileSetLastWriteTimeUtc(targetFilePath, systemIO.FileGetLastWriteTimeUtc(sourceFilePath));
+                        }
+                        catch
+                        {
+                        }
+                    }
                     if (m_verifyDestinationLength)
                         VerifyMatchingSize(targetFilePath, sourceFilePath);
                 }
@@ -457,7 +467,34 @@ namespace Duplicati.Library.Backend
                 MapException(ex);
                 throw;
             }
+        }
 
+        /// <inheritdoc />
+        public Task SetLastWriteTimeUtcAsync(string remotename, DateTime timestampUtc, CancellationToken cancellationToken)
+        {
+            try
+            {
+                string targetFilePath = GetRemoteName(remotename);
+                if (systemIO.FileExists(targetFilePath))
+                {
+                    systemIO.FileSetLastWriteTimeUtc(targetFilePath, timestampUtc);
+                    try
+                    {
+                        systemIO.FileSetCreationTimeUtc(targetFilePath, timestampUtc);
+                    }
+                    catch
+                    {
+                        // Creation time may not be supported on all filesystems/platforms; ignore failure
+                    }
+                }
+
+                return Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
         }
 
         /// <inheritdoc />

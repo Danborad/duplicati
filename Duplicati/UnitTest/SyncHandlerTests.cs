@@ -129,6 +129,45 @@ public class SyncHandlerTests : BasicSetupHelper
     }
 
     /// <summary>
+    /// Verifies that the source file's last write timestamp is preserved on the destination.
+    /// </summary>
+    [Test]
+    [Category("Sync")]
+    public async Task TestSyncPreservesFileTimestampsAsync()
+    {
+        var dataFolder = Path.Combine(BASEFOLDER, "sync_data_timestamps");
+        if (Directory.Exists(dataFolder)) Directory.Delete(dataFolder, true);
+        Directory.CreateDirectory(dataFolder);
+
+        var srcFile = Path.Combine(dataFolder, "photo.jpg");
+        File.WriteAllText(srcFile, "fake photo content");
+
+        // Set a specific timestamp in the past (e.g. 2025-05-05 15:59:02 UTC)
+        var expectedTimeUtc = new DateTime(2025, 5, 5, 15, 59, 2, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(srcFile, expectedTimeUtc);
+
+        var opts = new Dictionary<string, string>
+        {
+            ["no-encryption"] = "true",
+            ["snapshot-policy"] = "off"
+        };
+
+        using (var c = new Controller(backendUrl, opts, null))
+        {
+            var res = await c.SyncAsync(new[] { dataFolder }, null);
+            Assert.IsEmpty(res.Warnings, string.Join(Environment.NewLine, res.Warnings));
+            Assert.IsEmpty(res.Errors, string.Join(Environment.NewLine, res.Errors));
+            Assert.AreEqual(1, res.FilesUploaded);
+        }
+
+        var dstFile = Path.Combine(targetDir, "photo.jpg");
+        Assert.IsTrue(File.Exists(dstFile), "Target file should exist");
+        var actualTimeUtc = File.GetLastWriteTimeUtc(dstFile);
+        Assert.That((actualTimeUtc - expectedTimeUtc).Duration(), Is.LessThanOrEqualTo(TimeSpan.FromSeconds(2)),
+            $"Target file timestamp {actualTimeUtc:O} should match source timestamp {expectedTimeUtc:O}");
+    }
+
+    /// <summary>
     /// Verifies that the sync handler reports its progress via
     /// <see cref="SyncResults.OperationProgressUpdater"/>: the phase transitions through
     /// the new <c>Sync_*</c> phases (<c>Sync_Begin</c> -> <c>Sync_CountingFiles</c> ->

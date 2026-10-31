@@ -60,6 +60,7 @@ namespace Duplicati.UnitTest
             public Task PutAsync(Duplicati.Library.Main.Volumes.VolumeWriterBase blockVolume, Duplicati.Library.Main.Volumes.IndexVolumeWriter? indexVolume, Func<Task>? indexVolumeFinished, bool waitForComplete, Func<Task>? onDbUpdate, CancellationToken cancelToken) => throw new NotImplementedException();
             public Task PutFileUnencryptedAsync(string remotename, TempFile tempFile, CancellationToken cancelToken) => throw new NotImplementedException();
             public Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken) => throw new NotImplementedException();
+            public Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken) => throw new NotImplementedException();
             public Task<System.Collections.Generic.IEnumerable<Duplicati.Library.Interface.IFileEntry>> ListAsync(string? path, CancellationToken cancelToken) => throw new NotImplementedException();
             public Task EnsureFolderAsync(string? path, CancellationToken cancelToken) => throw new NotImplementedException();
             public TempFile DecryptFile(TempFile volume, string volume_name, Options options, bool dispose) => throw new NotImplementedException();

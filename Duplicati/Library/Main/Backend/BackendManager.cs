@@ -497,7 +497,7 @@ internal partial class BackendManager : IBackendManager
     /// <returns>An awaitable task</returns>
     public async Task PutFileUnencryptedAsync(string remotename, TempFile tempFile, CancellationToken cancelToken)
     {
-        var op = CreateUnencryptedPutOperation(remotename, tempFile, cancelToken);
+        var op = CreateUnencryptedPutOperation(remotename, tempFile, null, cancelToken);
         await QueueTaskAsync(op).ConfigureAwait(false);
         await op.GetResultAsync().ConfigureAwait(false);
     }
@@ -512,9 +512,21 @@ internal partial class BackendManager : IBackendManager
     /// <param name="tempFile">The temporary file to upload</param>
     /// <param name="cancelToken">The cancellation token</param>
     /// <returns>An awaitable task</returns>
-    public async Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken)
+    public Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken)
+        => PutFileUnencryptedWithPathAsync(remotename, tempFile, null, cancelToken);
+
+    /// <summary>
+    /// Uploads a file to the backend without encryption, treating the remote name
+    /// as a relative path that may contain sub-folders, and optionally setting the remote file's modification time.
+    /// </summary>
+    /// <param name="remotename">The relative path of the remote file, which may contain sub-folders</param>
+    /// <param name="tempFile">The temporary file to upload</param>
+    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    public async Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken)
     {
-        var op = CreateUnencryptedPutOperation(remotename, tempFile, cancelToken);
+        var op = CreateUnencryptedPutOperation(remotename, tempFile, lastModificationUtc, cancelToken);
         ApplyPathTranslation(op);
         await QueueTaskAsync(op).ConfigureAwait(false);
         await op.GetResultAsync().ConfigureAwait(false);
@@ -525,9 +537,10 @@ internal partial class BackendManager : IBackendManager
     /// </summary>
     /// <param name="remotename">The name of the remote file</param>
     /// <param name="tempFile">The temporary file to upload</param>
+    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
     /// <param name="cancelToken">The cancellation token</param>
     /// <returns>The prepared put operation, ready to be queued</returns>
-    private PutOperation CreateUnencryptedPutOperation(string remotename, TempFile tempFile, CancellationToken cancelToken)
+    private PutOperation CreateUnencryptedPutOperation(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken)
     {
         var op = new PutOperation(remotename, context, true, cancelToken)
         {
@@ -537,6 +550,7 @@ internal partial class BackendManager : IBackendManager
             OriginalIndexFile = null,
             IndexVolumeFinishedCallback = null,
             OnDbUpdate = PutOperation.OnDbUpdateDefault,
+            LastModificationUtc = lastModificationUtc,
         };
 
         // Sets the task as already completed

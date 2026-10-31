@@ -955,6 +955,15 @@ internal class SyncHandler
         using (var fs = System.IO.File.OpenWrite(temp))
             await s.CopyToAsync(fs, cancellationToken);
 
+        try
+        {
+            System.IO.File.SetLastWriteTimeUtc(temp, lf.LastModificationUtc);
+        }
+        catch
+        {
+            // Ignore failure setting timestamp on local temporary file
+        }
+
         string? hash = null;
         if (verifyHash)
         {
@@ -965,7 +974,7 @@ internal class SyncHandler
 
         // The caller has already ensured the destination folder exists, so we put the
         // file directly. No EnsureFolderAsync call here.
-        await backendManager.PutFileUnencryptedWithPathAsync(relPath, temp, cancellationToken);
+        await backendManager.PutFileUnencryptedWithPathAsync(relPath, temp, lf.LastModificationUtc, cancellationToken);
 
         // Commit the inventory update and intent clearance atomically so a crash
         // between them cannot leave the inventory and intent journal inconsistent.

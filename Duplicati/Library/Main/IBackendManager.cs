@@ -69,7 +69,19 @@ internal interface IBackendManager : IDisposable
     /// <param name="tempFile">The file to upload</param>
     /// <param name="cancelToken">The cancellation token</param>
     /// <returns>An awaitable task</returns>
-    Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken);
+    Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken)
+        => PutFileUnencryptedWithPathAsync(remotename, tempFile, null, cancelToken);
+
+    /// <summary>
+    /// Uploads a file to the backend without encryption, treating the remote name
+    /// as a relative path that may contain sub-folders, and optionally setting the last modification timestamp.
+    /// </summary>
+    /// <param name="remotename">The relative path of the file to upload to, which may contain sub-folders</param>
+    /// <param name="tempFile">The file to upload</param>
+    /// <param name="lastModificationUtc">The last modification time in UTC, or null</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken);
 
     /// <summary>
     /// Waits for the backend queue to be empty
