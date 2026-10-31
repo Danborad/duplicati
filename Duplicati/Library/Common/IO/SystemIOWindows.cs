@@ -515,7 +515,7 @@ namespace Duplicati.Library.Common.IO
                 : File.OpenWrite(AddExtendedDevicePathPrefix(path));
 
         public FileStream FileCreate(string path)
-            => File.Create(AddExtendedDevicePathPrefix(path));
+            => new FileStream(AddExtendedDevicePathPrefix(path), FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true);
 
         public FileAttributes GetFileAttributes(string path)
             => File.GetAttributes(AddExtendedDevicePathPrefix(path));

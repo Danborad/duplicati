@@ -950,31 +950,28 @@ internal class SyncHandler
         // per folder against a fresh listing under UseRemoteState, or cleared outright).
         await db.UpsertPendingOperationAsync(relPath, operation, lf.Size, null, cancellationToken);
 
-        using var temp = new TempFile();
-        using (var s = await lf.OpenRead(cancellationToken))
-        using (var fs = System.IO.File.OpenWrite(temp))
-            await s.CopyToAsync(fs, cancellationToken);
-
-        try
-        {
-            System.IO.File.SetLastWriteTimeUtc(temp, lf.LastModificationUtc);
-        }
-        catch
-        {
-            // Ignore failure setting timestamp on local temporary file
-        }
-
         string? hash = null;
-        if (verifyHash)
+        await using (var rawStream = await lf.OpenRead(cancellationToken).ConfigureAwait(false))
         {
-            using var hashStream = System.IO.File.OpenRead(temp);
-            using var hasher = HashFactory.CreateHasher("SHA256");
-            hash = Convert.ToBase64String(hasher.ComputeHash(hashStream));
-        }
+            System.IO.Stream uploadStream = rawStream;
+            HashCalculatingStream? hashStream = null;
+            if (verifyHash)
+            {
+                var hasher = HashFactory.CreateHasher("SHA256");
+                uploadStream = hashStream = new HashCalculatingStream(rawStream, hasher);
+            }
 
-        // The caller has already ensured the destination folder exists, so we put the
-        // file directly. No EnsureFolderAsync call here.
-        await backendManager.PutFileUnencryptedWithPathAsync(relPath, temp, lf.LastModificationUtc, cancellationToken);
+            try
+            {
+                await backendManager.PutStreamUnencryptedWithPathAsync(relPath, uploadStream, lf.Size, lf.LastModificationUtc, cancellationToken).ConfigureAwait(false);
+                if (hashStream != null)
+                    hash = Convert.ToBase64String(hashStream.GetFinalHash());
+            }
+            finally
+            {
+                hashStream?.Dispose();
+            }
+        }
 
         // Commit the inventory update and intent clearance atomically so a crash
         // between them cannot leave the inventory and intent journal inconsistent.

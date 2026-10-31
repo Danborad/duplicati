@@ -64,6 +64,14 @@ partial class BackendManager
         /// </summary>
         public required TempFile? LocalTempfile { get; set; }
         /// <summary>
+        /// An optional direct source stream, avoiding temporary files on disk
+        /// </summary>
+        public System.IO.Stream? SourceStream { get; init; }
+        /// <summary>
+        /// The size of the source stream
+        /// </summary>
+        public long SourceStreamSize { get; init; }
+        /// <summary>
         /// Flag indicating if the file is not to be encrypted
         /// </summary>
         public required bool Unencrypted { get; set; }
@@ -127,6 +135,12 @@ partial class BackendManager
         {
             if (encryptionAndHashingTask != null)
                 throw new Exception("Encryption already started");
+
+            if (SourceStream != null)
+            {
+                encryptionAndHashingTask = Task.FromResult((string.Empty, SourceStreamSize));
+                return;
+            }
 
             // Run detached to allow encrypting while waiting in upload queue
             encryptionAndHashingTask = Task.Run(() =>
@@ -300,13 +314,28 @@ partial class BackendManager
                 Context.ProgressHandler.BeginTransfer(BackendActionType.Put, size, RemoteFilename);
                 if (backend is IStreamingBackend streamingBackend && streamingBackend.SupportsStreaming && !Context.Options.DisableStreamingTransfers)
                 {
-                    using var fs = System.IO.File.OpenRead(LocalFilename);
-                    using var ts = new ThrottleEnabledStream(fs, Context.UploadThrottleManager, Context.DownloadThrottleManager);
-                    using var pgs = new ProgressReportingStream(ts, pg => Context.ProgressHandler.HandleProgress(pg, RemoteFilename));
-                    await streamingBackend.PutAsync(effectiveName, pgs, cancelToken).ConfigureAwait(false);
+                    var dataStream = SourceStream ?? System.IO.File.OpenRead(LocalFilename);
+                    using (SourceStream != null ? null : dataStream)
+                    using (var ts = new ThrottleEnabledStream(dataStream, Context.UploadThrottleManager, Context.DownloadThrottleManager))
+                    using (var pgs = new ProgressReportingStream(ts, pg => Context.ProgressHandler.HandleProgress(pg, RemoteFilename)))
+                    {
+                        await streamingBackend.PutAsync(effectiveName, pgs, cancelToken).ConfigureAwait(false);
+                    }
                 }
                 else
-                    await backend.PutAsync(effectiveName, LocalFilename, cancelToken).ConfigureAwait(false);
+                {
+                    if (SourceStream != null)
+                    {
+                        using var temp = new TempFile();
+                        await using (var fs = System.IO.File.OpenWrite(temp))
+                            await SourceStream.CopyToAsync(fs, cancelToken).ConfigureAwait(false);
+                        await backend.PutAsync(effectiveName, temp, cancelToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await backend.PutAsync(effectiveName, LocalFilename, cancelToken).ConfigureAwait(false);
+                    }
+                }
 
                 if (LastModificationUtc.HasValue && backend is ISetTimestampBackend timestampBackend)
                 {

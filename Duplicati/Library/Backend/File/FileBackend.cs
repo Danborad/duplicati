@@ -394,7 +394,10 @@ namespace Duplicati.Library.Backend
                 long copiedBytes = 0;
                 using (var targetStream = systemIO.FileCreate(targetFilePath))
                 using (var timeoutStream = targetStream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout))
-                    copiedBytes = await Utility.Utility.CopyStreamAsync(sourceStream, timeoutStream, true, cancelToken).ConfigureAwait(false);
+                {
+                    var buf = new byte[1024 * 1024];
+                    copiedBytes = await Utility.Utility.CopyStreamAsync(sourceStream, timeoutStream, true, cancelToken, buf).ConfigureAwait(false);
+                }
 
                 VerifyMatchingSize(targetFilePath, sourceStream, copiedBytes);
             }

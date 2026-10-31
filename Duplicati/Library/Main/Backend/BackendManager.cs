@@ -533,6 +533,45 @@ internal partial class BackendManager : IBackendManager
     }
 
     /// <summary>
+    /// Uploads a stream directly to the backend without encryption, avoiding temporary files on disk.
+    /// </summary>
+    /// <param name="remotename">The relative path of the file to upload to, which may contain sub-folders</param>
+    /// <param name="stream">The source stream to upload</param>
+    /// <param name="size">The size of the source stream, or -1 if unknown</param>
+    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    public async Task PutStreamUnencryptedWithPathAsync(string remotename, System.IO.Stream stream, long size, DateTime? lastModificationUtc, CancellationToken cancelToken)
+    {
+        var op = CreateUnencryptedStreamPutOperation(remotename, stream, size, lastModificationUtc, cancelToken);
+        ApplyPathTranslation(op);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        await op.GetResultAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Creates a prepared operation for uploading a direct stream without encryption
+    /// </summary>
+    private PutOperation CreateUnencryptedStreamPutOperation(string remotename, System.IO.Stream stream, long size, DateTime? lastModificationUtc, CancellationToken cancelToken)
+    {
+        var op = new PutOperation(remotename, context, true, cancelToken)
+        {
+            LocalTempfile = null,
+            SourceStream = stream,
+            SourceStreamSize = size,
+            Unencrypted = true,
+            TrackedInDb = false,
+            OriginalIndexFile = null,
+            IndexVolumeFinishedCallback = null,
+            OnDbUpdate = PutOperation.OnDbUpdateDefault,
+            LastModificationUtc = lastModificationUtc,
+        };
+
+        op.StartEncryptionAndHashing();
+        return op;
+    }
+
+    /// <summary>
     /// Creates a prepared operation for uploading a file without encryption
     /// </summary>
     /// <param name="remotename">The name of the remote file</param>

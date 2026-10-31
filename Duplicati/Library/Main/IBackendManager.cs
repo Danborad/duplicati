@@ -84,6 +84,17 @@ internal interface IBackendManager : IDisposable
     Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken);
 
     /// <summary>
+    /// Uploads a stream directly to the backend without encryption, avoiding temporary files on disk.
+    /// </summary>
+    /// <param name="remotename">The relative path of the file to upload to, which may contain sub-folders</param>
+    /// <param name="stream">The source stream to upload</param>
+    /// <param name="size">The size of the source stream, or -1 if unknown</param>
+    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task PutStreamUnencryptedWithPathAsync(string remotename, System.IO.Stream stream, long size, DateTime? lastModificationUtc, CancellationToken cancelToken);
+
+    /// <summary>
     /// Waits for the backend queue to be empty
     /// </summary>
     /// <param name="cancellationToken">The cancellation token</param>

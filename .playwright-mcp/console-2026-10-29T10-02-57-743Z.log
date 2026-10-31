@@ -1,0 +1,3 @@
+[     293ms] [ERROR] Failed to load resource: the server responded with a status of 401 (Unauthorized) @ http://127.0.0.1:22121/api/event:0
+[     294ms] [ERROR] Failed to load resource: the server responded with a status of 401 (Unauthorized) @ http://127.0.0.1:22121/api/info:0
+[  169287ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:22121/api/fs/list?location%5Bdirectory%5D=%2Fvol1%2F1000%2Fdocker%2FDuplicati&path=%2F_assets%2F:0

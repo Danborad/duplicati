@@ -1,0 +1,25 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends libssl3 ca-certificates libicu72 libgssapi-krb5-2 tini curl procps && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV XDG_CONFIG_HOME=/data
+VOLUME /data
+
+ENV DUPLICATI__WEBSERVICE_PORT=8200
+ENV DUPLICATI__WEBSERVICE_INTERFACE=any
+
+COPY bin/server-selfcontained/ /opt/duplicati/
+COPY Duplicati/Server/webroot/ngclient/ /opt/duplicati/webroot/ngclient/
+COPY ReleaseBuilder/Resources/Docker/run-as-user.sh /run-as-user.sh
+RUN chmod +x /run-as-user.sh && \
+    ln -sf /opt/duplicati/Duplicati.Server /opt/duplicati/duplicati-server && \
+    chmod +x /opt/duplicati/Duplicati.Server /opt/duplicati/duplicati-server
+
+ENV PATH="/opt/duplicati:${PATH}"
+
+EXPOSE 8200
+ENTRYPOINT [ "/usr/bin/tini", "--", "/run-as-user.sh" ]
+CMD ["duplicati-server"]

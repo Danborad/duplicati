@@ -133,7 +133,7 @@ namespace Duplicati.Library.Common.IO
 
         public FileStream FileCreate(string path)
         {
-            return File.Create(path);
+            return new FileStream(NormalizePath(path), FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true);
         }
 
         public FileAttributes GetFileAttributes(string path)

@@ -20,6 +20,8 @@
 // DEALINGS IN THE SOFTWARE.
 
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Duplicati.Library.Utility
 {
@@ -47,6 +49,16 @@ namespace Duplicati.Library.Utility
 
         protected override void Dispose(bool disposing)
         {
+            if (disposing && m_finalHash == null && m_hash != null)
+            {
+                try
+                {
+                    m_hash.TransformFinalBlock(m_hashbuffer, 0, m_hashbufferLength);
+                    m_finalHash = m_hash.Hash;
+                }
+                catch { }
+            }
+
             base.Dispose(disposing);
 
             if (m_hash != null)
@@ -70,6 +82,17 @@ namespace Duplicati.Library.Utility
             return tmp;
         }
 
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            if (m_hasWritten)
+                throw new InvalidOperationException(Strings.HashCalculatingStream.IncorrectUsageError);
+            m_hasRead = true;
+
+            int tmp = await base.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+            UpdateHash(buffer, offset, tmp);
+            return tmp;
+        }
+
         public override void Write(byte[] buffer, int offset, int count)
         {
             if (m_hasRead)
@@ -79,6 +102,17 @@ namespace Duplicati.Library.Utility
             UpdateHash(buffer, offset, count);
 
             base.Write(buffer, offset, count);
+        }
+
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            if (m_hasRead)
+                throw new InvalidOperationException(Strings.HashCalculatingStream.IncorrectUsageError);
+            m_hasWritten = true;
+
+            UpdateHash(buffer, offset, count);
+
+            await base.WriteAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
         }
 
         private void UpdateHash(byte[] buffer, int offset, int count)
