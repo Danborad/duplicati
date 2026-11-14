@@ -25,12 +25,13 @@ using Duplicati.Library.Utility;
 using Duplicati.Library.Utility.Options;
 using System.Net;
 using System.Runtime.CompilerServices;
+using Duplicati.StreamUtil;
 
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Backend
 {
-    public class WEBDAV : IStreamingBackend, IRenameEnabledBackend
+    public class WEBDAV : IStreamingBackend, IRenameEnabledBackend, IModificationTimeEnabledBackend
     {
         /// <summary>
         /// The integrated authentication option name
@@ -502,7 +503,7 @@ namespace Duplicati.Library.Backend
                     response.Content.ReadAsStreamAsync(ct)
                 ).ConfigureAwait(false);
 
-                using var timeoutStream = sourceStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, true);
+                using var timeoutStream = sourceStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
                 if (!string.IsNullOrWhiteSpace(m_debugPropfindFile))
                 {
                     // Write the response to a file for debugging purposes
@@ -570,8 +571,12 @@ namespace Duplicati.Library.Backend
                     if (s != null)
                         try
                         {
-                            //Not important if this succeeds
-                            lastAccess = lastModified = DateTime.Parse(s.InnerText, System.Globalization.CultureInfo.InvariantCulture);
+                            // Not important if this succeeds.
+                            // The value is normally an RFC 1123 date in GMT; a plain parse would convert it to
+                            // local time, which the remote synchronization planner then compares against the
+                            // UTC timestamps of other backends. A value without a zone is taken as UTC.
+                            lastAccess = lastModified = DateTime.Parse(s.InnerText, System.Globalization.CultureInfo.InvariantCulture,
+                                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal);
                         }
                         catch { }
 
@@ -703,12 +708,30 @@ namespace Duplicati.Library.Backend
         #region IStreamingBackend Members
 
         ///<inheritdoc/>
-        public async Task PutAsync(string remotename, Stream stream, CancellationToken cancelToken)
+        public Task PutAsync(string remotename, Stream stream, CancellationToken cancelToken)
+            => PutAsync(remotename, stream, null, cancelToken);
+
+        ///<inheritdoc/>
+        public Task PutAsync(string remotename, Stream stream, DateTime lastModifiedUtc, CancellationToken cancelToken)
+            => PutAsync(remotename, stream, (DateTime?)lastModifiedUtc, cancelToken);
+
+        /// <summary>
+        /// Uploads the stream, optionally asking the server to keep the given modification time
+        /// </summary>
+        /// <param name="remotename">The remote filename</param>
+        /// <param name="stream">The stream to upload</param>
+        /// <param name="lastModifiedUtc">The modification time to keep, or null for the time of the upload</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        private async Task PutAsync(string remotename, Stream stream, DateTime? lastModifiedUtc, CancellationToken cancelToken)
         {
             try
             {
                 using var request = CreateRequest(remotename, HttpMethod.Put);
-                using var timeoutStream = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false);
+                // Nextcloud and ownCloud set the modification time from this header, in seconds
+                // since the epoch; other servers ignore it
+                if (lastModifiedUtc.HasValue)
+                    request.Headers.Add("X-OC-Mtime", Utility.Utility.NormalizeDateTimeToEpochSeconds(lastModifiedUtc.Value).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                using var timeoutStream = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
                 request.Content = new StreamContent(timeoutStream);
                 request.Content.Headers.ContentLength = stream.Length;
                 request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
@@ -733,7 +756,7 @@ namespace Duplicati.Library.Backend
             try
             {
                 using var request = CreateRequest(remotename, HttpMethod.Get);
-                using var timeoutStream = stream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false);
+                using var timeoutStream = stream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
                 await GetHttpClient().DownloadFile(request, timeoutStream, null, cancelToken).ConfigureAwait(false);
             }
             catch (HttpRequestException wex)

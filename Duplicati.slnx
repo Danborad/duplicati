@@ -12,6 +12,7 @@
     <Project Path="Duplicati/Library/Backend/Filen/Duplicati.Library.Backend.Filen.csproj" />
     <Project Path="Duplicati/Library/Backend/FTP/Duplicati.Library.Backend.FTP.csproj" />
     <Project Path="Duplicati/Library/Backend/GoogleServices/Duplicati.Library.Backend.GoogleServices.csproj" />
+    <Project Path="Duplicati/Library/Backend/Internxt/Duplicati.Library.Backend.Internxt.csproj" />
     <Project Path="Duplicati/Library/Backend/Idrivee2/Duplicati.Library.Backend.Idrivee2.csproj">
       <BuildDependency Project="Duplicati/Library/Backend/S3/Duplicati.Library.Backend.S3.csproj" />
     </Project>
@@ -45,6 +46,7 @@
     <Project Path="Duplicati/GUI/Duplicati.GUI.TrayIcon/Duplicati.GUI.TrayIcon.csproj" />
     <Project Path="Duplicati/Server/Duplicati.Server.csproj" />
     <Project Path="Duplicati/Service/Duplicati.Service.csproj" />
+    <Project Path="Duplicati/UpdateHelper/Duplicati.UpdateHelper.csproj" />
     <Project Path="Duplicati/WindowsService/Duplicati.WindowsService.csproj" />
   </Folder>
   <Folder Name="/Executables/">
@@ -66,6 +68,7 @@
     <Project Path="Executables/Duplicati.GUI.TrayIcon/Duplicati.GUI.TrayIcon.csproj" />
     <Project Path="Executables/Duplicati.Server/Duplicati.Server.csproj" />
     <Project Path="Executables/Duplicati.Service/Duplicati.Service.csproj" />
+    <Project Path="Executables/Duplicati.UpdateHelper/Duplicati.UpdateHelper.csproj" />
     <Project Path="Executables/Duplicati.WindowsModulesLoader/Duplicati.WindowsModulesLoader.csproj" />
     <Project Path="Executables/Duplicati.WindowsService/Duplicati.WindowsService.csproj" />
   </Folder>
@@ -97,6 +100,7 @@
   <Project Path="Duplicati/Library/Backend/OAuthHelper/Duplicati.Library.OAuthHelper.csproj" />
   <Project Path="Duplicati/Library/Certificates/Duplicati.Library.Certificates.csproj" />
   <Project Path="Duplicati/Library/Backends/Duplicati.Library.Backends.csproj" />
+  <Project Path="Duplicati/Library/ChangeTracking/Duplicati.Library.ChangeTracking.csproj" />
   <Project Path="Duplicati/Library/Common/Duplicati.Library.Common.csproj" />
   <Project Path="Duplicati/Library/Encryption/Duplicati.Library.Encryption.csproj" />
   <Project Path="Duplicati/Library/Interface/Duplicati.Library.Interface.csproj" />

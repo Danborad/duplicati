@@ -1320,6 +1320,19 @@ namespace Duplicati.Library.Main.Database.Local
             ", token)
                 .ConfigureAwait(false);
 
+            // Volume and block ids are reused, so a copy left behind would be claimed by the next
+            // volume or block to get the id, which does not hold it
+            await deletecmd.ExecuteNonQueryAsync($@"
+                DELETE FROM ""DuplicateBlock""
+                WHERE ""VolumeID"" IN ({volIdsSubQuery})
+                OR ""BlockID"" IN (
+                    SELECT ""ID""
+                    FROM ""Block""
+                    WHERE ""VolumeID"" IN ({volIdsSubQuery})
+                )
+            ", token)
+                .ConfigureAwait(false);
+
             await deletecmd.ExecuteNonQueryAsync($@"
                 DELETE FROM ""Block""
                 WHERE ""VolumeID"" IN ({volIdsSubQuery})
@@ -2882,11 +2895,15 @@ namespace Duplicati.Library.Main.Database.Local
                 var ftt = new FilteredFilenameTable(db);
 
                 var type = FilterType.Regexp;
+                var caseSensitive = FilterExpression.DefaultCaseSensitive;
                 if (filter is FilterExpression expression)
+                {
                     type = expression.Type;
+                    caseSensitive = expression.CaseSensitive;
+                }
 
                 // Bugfix: SQLite does not handle case-insensitive LIKE with non-ascii characters
-                if (type != FilterType.Regexp && !Library.Utility.Utility.IsFSCaseSensitive && filter.ToString()!.Any(x => x > 127))
+                if (type != FilterType.Regexp && !caseSensitive && filter.ToString()!.Any(x => x > 127))
                     type = FilterType.Regexp;
 
                 if (filter.Empty)
@@ -2957,7 +2974,15 @@ namespace Duplicati.Library.Main.Database.Local
                             sb.Append(" OR ");
 
                         var argName = $"@Arg{Library.Utility.Utility.FormatInvariantValue(args.Count)}";
-                        if (type == FilterType.Wildcard)
+                        if (type == FilterType.Wildcard && caseSensitive)
+                        {
+                            // LIKE ignores the casing of ASCII characters, where GLOB compares exactly.
+                            // GLOB uses the same wildcards as the filter, but also reads a bracket
+                            // as the start of a character set, so a bracket is written as a set of itself
+                            sb.Append(@$"""Path"" GLOB {argName}");
+                            args.Add(argName, f.Replace("[", "[[]"));
+                        }
+                        else if (type == FilterType.Wildcard)
                         {
                             sb.Append(@$"""Path"" LIKE {argName}");
                             args.Add(argName, f.Replace('*', '%').Replace('?', '_'));
@@ -3606,12 +3631,8 @@ namespace Duplicati.Library.Main.Database.Local
             var id = -1L;
             if (m_connection != null && result != null)
             {
-                if (result is BasicResults basicResults)
-                {
-                    await basicResults.FlushLogAsync(this, token).ConfigureAwait(false);
-                    if (basicResults.EndTime.Ticks == 0)
-                        basicResults.EndTime = DateTime.UtcNow;
-                }
+                if (result is BasicResults basicResults && basicResults.EndTime.Ticks == 0)
+                    basicResults.EndTime = DateTime.UtcNow;
 
                 var serializer = new JsonFormatSerializer();
                 await LogMessageAsync(ResultLogType,
@@ -3708,12 +3729,14 @@ namespace Duplicati.Library.Main.Database.Local
         }
 
         /// <summary>
-        /// The path separators on this system.
+        /// The path separators of a Unix path. A backslash is an ordinary character in its names.
         /// </summary>
-        private static readonly char[] _pathseparators = [
-            Path.DirectorySeparatorChar,
-            Path.AltDirectorySeparatorChar,
-        ];
+        private static readonly char[] _unixPathSeparators = ['/'];
+
+        /// <summary>
+        /// The path separators of a Windows path.
+        /// </summary>
+        private static readonly char[] _windowsPathSeparators = ['\\', '/'];
 
         /// <summary>
         /// Helper method that splits a path on the last path separator.
@@ -3725,7 +3748,10 @@ namespace Duplicati.Library.Main.Database.Local
             if (string.IsNullOrEmpty(path))
                 throw new ArgumentException($"Invalid path: {path}", nameof(path));
 
-            int nLast = path.TrimEnd(_pathseparators).LastIndexOfAny(_pathseparators);
+            // A backup keeps the paths of the system that made it, which is not this one when a
+            // backup is restored on another system, so the separators are taken from the path
+            var separators = path.StartsWith('/') ? _unixPathSeparators : _windowsPathSeparators;
+            int nLast = path.TrimEnd(separators).LastIndexOfAny(separators);
             if (nLast >= 0)
                 return new KeyValuePair<string, string>(path.Substring(0, nLast + 1), path.Substring(nLast + 1));
 

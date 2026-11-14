@@ -30,6 +30,7 @@ using Duplicati.Library.Interface;
 using Duplicati.Library.Utility;
 using Duplicati.Library.Utility.Options;
 using Exception = System.Exception;
+using Duplicati.StreamUtil;
 
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
@@ -74,6 +75,7 @@ public class OpenStackStorage : IStreamingBackend, IRenameEnabledBackend
 
     public static readonly KeyValuePair<string, string?>[] KnownOpenstackProviders =
     [
+        new("Blomp Cloud Storage", "https://authenticate.blomp.com/v2.0"),
         new("Rackspace US", "https://identity.api.rackspacecloud.com/v2.0"),
         new("Rackspace UK", "https://lon.identity.api.rackspacecloud.com/v2.0"),
         new("OVH Cloud Storage", "https://auth.cloud.ovh.net/v3"),
@@ -347,7 +349,7 @@ public class OpenStackStorage : IStreamingBackend, IRenameEnabledBackend
     {
         var url = JoinUrls(await GetSimpleStorageEndPoint(cancelToken).ConfigureAwait(false), m_container, UrlEncoding.UrlPathEncode(m_prefix + remotename));
         using var req = m_helper.CreateRequest(url, "PUT");
-        await using var ts = stream.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false);
+        await using var ts = stream.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
 
         req.Content = new StreamContent(ts);
         req.Content.Headers.Add("Content-Type", "application/octet-stream");
@@ -366,7 +368,7 @@ public class OpenStackStorage : IStreamingBackend, IRenameEnabledBackend
             using var req = m_helper.CreateRequest(url);
             using var resp = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, ct => m_helper.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)).ConfigureAwait(false);
             await using var rs = await resp.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
-            await using var ts = rs.ObserveReadTimeout(_timeouts.ReadWriteTimeout);
+            await using var ts = rs.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
             await Utility.Utility.CopyStreamAsync(ts, stream, cancelToken).ConfigureAwait(false);
         }
         catch (HttpRequestException wex)

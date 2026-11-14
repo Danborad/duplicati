@@ -120,6 +120,12 @@ namespace Duplicati.Library.Modules.Builtin.Strings
     }
     internal static class SendMail
     {
+        public static string AcceptAnyCertificateLong(string optionname) { return LC.L(@"Use this option to accept any server certificate, regardless of what errors it may have. Please use --{0} instead, whenever possible.", optionname); }
+        public static string AcceptAnyCertificateShort { get { return LC.L(@"Accept any server certificate"); } }
+        public static string AcceptSpecifiedCertificateLong { get { return LC.L(@"If your server certificate is reported as invalid (e.g. with self-signed certificates), you can supply the certificate hash (SHA1) to approve it anyway. The hash value must be entered in hex format without spaces or colons. You can enter multiple hashes separated by commas."); } }
+        public static string AcceptSpecifiedCertificateShort { get { return LC.L(@"Optionally accept a known SSL certificate"); } }
+        public static string IgnoreRevocationFailureLong { get { return LC.L(@"Use this option to ignore certificate revocation check failures, such as when the revocation server is offline or the revocation status is unknown."); } }
+        public static string IgnoreRevocationFailureShort { get { return LC.L(@"Ignore certificate revocation check failures"); } }
         public static string Description { get { return LC.L(@"This module can send email after an operation completes"); } }
         public static string Displayname { get { return LC.L(@"Send mail"); } }
         public static string FailedToLookupMXServer(string optionname) { return LC.L(@"Unable to find the destination mail server through MX lookup. Please use the option --{0} to specify what SMTP server to use.", optionname); }
@@ -133,6 +139,8 @@ In the message body, certain tokens are replaced:
 
 All command line options are also reported within %value%, e.g. %volsize%. Any unknown/unset value is removed."); } }
         public static string OptionBodyShort { get { return LC.L(@"The message body"); } }
+        public static string OptionBodyHtmlLong(string optionname) { return LC.L(@"Use this option to send the message body given with --{0} as HTML instead of plain text. The values put into the body, such as %RESULT%, are escaped as HTML. The result keeps its line breaks only inside an element such as <pre>, for example: <pre>%RESULT%</pre>", optionname); }
+        public static string OptionBodyHtmlShort { get { return LC.L(@"Send the message body as HTML"); } }
         public static string OptionPasswordLong { get { return LC.L(@"Use this option to set the password used to authenticate with the SMTP server if required."); } }
         public static string OptionPasswordShort { get { return LC.L(@"SMTP Password"); } }
         public static string OptionRecipientLong { get { return LC.L(@"This setting is required if mail should be sent, all other settings have default values. You can supply multiple email addresses separated with commas, and you can use the normal address format as specified by RFC2822 section 3.4.
@@ -195,6 +203,12 @@ You can supply multiple options with a comma separator, e.g. ""{0},{1}"". The sp
         public static string LoginTimeoutError { get { return LC.L(@"Timeout occurred while logging in to jabber server"); } }
         public static string SendxmppextraparametersLong { get { return LC.L(@"Use this option to set extra parameters for the message body. This parameter can either be a querystring (e.g. 'parameter1=value1&parameter2=value2') or a JSON key/value object."); } }
         public static string SendxmppextraparametersShort { get { return LC.L(@"Extra parameters for the message sent"); } }
+        public static string AcceptAnyCertificateLong(string optionname) { return LC.L(@"Use this option to accept any server certificate, regardless of what errors it may have. Please use --{0} instead, whenever possible.", optionname); }
+        public static string AcceptAnyCertificateShort { get { return LC.L(@"Accept any server certificate"); } }
+        public static string AcceptSpecifiedCertificateLong { get { return LC.L(@"If your server certificate is reported as invalid (e.g. with self-signed certificates), you can supply the certificate hash (SHA1) to approve it anyway. The hash value must be entered in hex format without spaces or colons. You can enter multiple hashes separated by commas."); } }
+        public static string AcceptSpecifiedCertificateShort { get { return LC.L(@"Optionally accept a known SSL certificate"); } }
+        public static string IgnoreRevocationFailureLong { get { return LC.L(@"Use this option to ignore certificate revocation check failures, such as when the revocation server is offline or the revocation status is unknown."); } }
+        public static string IgnoreRevocationFailureShort { get { return LC.L(@"Ignore certificate revocation check failures"); } }
     }
 
     internal static class SendTelegramMessage

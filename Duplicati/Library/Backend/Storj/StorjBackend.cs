@@ -27,6 +27,7 @@ using System.Runtime.CompilerServices;
 using uplink.NET.Interfaces;
 using uplink.NET.Models;
 using uplink.NET.Services;
+using Duplicati.StreamUtil;
 
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
@@ -133,6 +134,18 @@ namespace Duplicati.Library.Backend.Storj
             _timeouts = TimeoutOptionsHelper.Parse(options);
         }
 
+        /// <summary>
+        /// Creates a backend on the given services, without loading the native library; for tests
+        /// </summary>
+        internal Storj(IBucketService bucketService, IObjectService objectService, TimeoutOptionsHelper.Timeouts timeouts)
+        {
+            _bucket = STORJ_DEFAULT_BUCKET;
+            _access = null!;
+            _bucketService = bucketService;
+            _objectService = objectService;
+            _timeouts = timeouts;
+        }
+
         /// <inheritdoc/>
         public string DisplayName => Strings.Storj.DisplayName;
 
@@ -205,14 +218,13 @@ namespace Duplicati.Library.Backend.Storj
             var bucket = await GetBucketAsync(cancelToken).ConfigureAwait(false);
             var download = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, _ => _objectService.DownloadObjectAsync(bucket, GetBasePath() + remotename, new DownloadOptions(), false)).ConfigureAwait(false);
             await WaitForTransferAsync(download.StartDownloadAsync(), () => download.BytesReceived, download.Cancel, _timeouts.ReadWriteTimeout, cancelToken).ConfigureAwait(false);
+            if (!download.Completed)
+                throw new Exception(download.ErrorMessage);
 
-            if (download.Completed)
+            using (var file = new FileStream(filename, FileMode.Create))
             {
-                using (var file = new FileStream(filename, FileMode.Create))
-                {
-                    await file.WriteAsync(download.DownloadedBytes, 0, (int)download.BytesReceived, cancelToken).ConfigureAwait(false);
-                    await file.FlushAsync(cancelToken).ConfigureAwait(false);
-                }
+                await file.WriteAsync(download.DownloadedBytes, 0, (int)download.BytesReceived, cancelToken).ConfigureAwait(false);
+                await file.FlushAsync(cancelToken).ConfigureAwait(false);
             }
         }
 
@@ -221,7 +233,7 @@ namespace Duplicati.Library.Backend.Storj
             var index = 0;
             var bucket = await GetBucketAsync(cancelToken).ConfigureAwait(false);
             var download = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, _ => _objectService.DownloadObjectAsync(bucket, GetBasePath() + remotename, new DownloadOptions(), false)).ConfigureAwait(false);
-            using var ts = stream.ObserveWriteTimeout(_timeouts.ReadWriteTimeout, false);
+            using var ts = stream.ObserveWriteTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
             download.DownloadOperationProgressChanged += (op) =>
             {
                 cancelToken.ThrowIfCancellationRequested();
@@ -234,6 +246,8 @@ namespace Duplicati.Library.Backend.Storj
                 index = index + newPartLength;
             };
             await WaitForTransferAsync(download.StartDownloadAsync(), () => download.BytesReceived, download.Cancel, _timeouts.ReadWriteTimeout, cancelToken).ConfigureAwait(false);
+            if (!download.Completed)
+                throw new Exception(download.ErrorMessage);
         }
 
         /// <inheritdoc />
@@ -266,7 +280,7 @@ namespace Duplicati.Library.Backend.Storj
             var custom = new CustomMetadata();
             custom.Entries.Add(new CustomMetadataEntry { Key = StorjFile.STORJ_LAST_ACCESS, Value = DateTime.Now.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture) });
             custom.Entries.Add(new CustomMetadataEntry { Key = StorjFile.STORJ_LAST_MODIFICATION, Value = DateTime.Now.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture) });
-            using var ts = stream.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false);
+            using var ts = stream.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
             var upload = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, _ => _objectService.UploadObjectAsync(bucket, GetBasePath() + remotename, CreateUploadOptions(), ts, custom, false)).ConfigureAwait(false);
             await WaitForTransferAsync(upload.StartUploadAsync(), () => upload.BytesSent, upload.Cancel, _timeouts.ReadWriteTimeout, cancelToken).ConfigureAwait(false);
             if (upload.Failed)

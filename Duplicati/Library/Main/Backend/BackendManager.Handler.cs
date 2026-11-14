@@ -164,6 +164,10 @@ partial class BackendManager
         /// Whether any files have been downloaded
         /// </summary>
         private bool anyDownloaded;
+        /// <summary>
+        /// Whether a listing has found files, which shows the folder was there
+        /// </summary>
+        private bool anyListed;
 
         /// <summary>
         /// Creates and runs with an instance of the <see cref="Handler"/> class
@@ -192,7 +196,7 @@ partial class BackendManager
 
             // TODO Currently, only the restore process uses parallel downloads. If others need it as well, maybe use another option.
             maxParallelDownloads = Math.Max(1, context.Options.RestoreVolumeDownloaders);
-            maxParallelUploads = Math.Max(1, context.Options.AsynchronousConcurrentUploadLimit);
+            maxParallelUploads = GetMaxParallelUploads(context.Options.GetAsynchronousConcurrentUploadLimit(backendUrl));
             maxRetries = context.Options.NumberOfRetries;
             retryDelay = context.Options.RetryDelay;
             retryWithExponentialBackoff = context.Options.RetryWithExponentialBackoff;
@@ -254,6 +258,14 @@ partial class BackendManager
             await ReclaimCompletedTasksAsync(activeUploads);
             await ReclaimCompletedTasksAsync(activeDownloads);
         }
+
+        /// <summary>
+        /// Gets the number of uploads allowed at once; zero means no limit, as the option's help says
+        /// </summary>
+        /// <param name="limit">The configured upload limit</param>
+        /// <returns>The number of uploads allowed at once</returns>
+        private static int GetMaxParallelUploads(int limit)
+            => limit == 0 ? int.MaxValue : Math.Max(1, limit);
 
         /// <summary>
         /// Ensures that there are at most N - 1 active tasks
@@ -470,8 +482,10 @@ partial class BackendManager
                         return;
                     }
 
-                    // Object locking being unavailable is a permanent condition, so retrying cannot help
-                    if (Library.Utility.ExceptionExtensions.FlattenException(ex).Any(x => x is ObjectLockNotSupportedException))
+                    // Object locking or hard links being unavailable is a permanent condition, so retrying cannot help
+                    // A link whose source file is gone will not appear by waiting; the caller uploads the file instead
+                    if (Library.Utility.ExceptionExtensions.FlattenException(ex).Any(x => x is ObjectLockNotSupportedException or HardLinkNotSupportedException
+                        || (op is CreateHardLinkOperation && x is FileMissingException or System.IO.FileNotFoundException)))
                     {
                         context.Statwriter.SendEvent(op.Operation, BackendEventType.Failed, op.RemoteFilename, op.Size);
                         break;
@@ -503,17 +517,22 @@ partial class BackendManager
                     // Check if we can recover from the error
                     var recovered = false;
 
-                    // Check if this was a folder missing exception and we are allowed to autocreate folders
-                    if (!(anyDownloaded || anyUploaded) && context.Options.AutocreateFolders && Library.Utility.ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
+                    // Check if this was a folder missing exception and we are allowed to autocreate folders.
+                    // A folder that held files has gone away, as an unplugged drive does, and creating it again
+                    // would send the backup to a new, empty folder in its place.
+                    if (!(anyDownloaded || anyUploaded || anyListed) && context.Options.AutocreateFolders && Library.Utility.ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
                     {
                         if (await TryCreateFolderAsync(op).ConfigureAwait(false))
                             recovered = true;
                     }
 
                     // We did not recover, so wait or give up
-                    if (!recovered && retries <= maxRetries && retryDelay.Ticks != 0)
+                    // A server that rate limits the requests may say how long to wait, and retrying sooner only extends the limit
+                    var delay = recovered || retries > maxRetries
+                        ? TimeSpan.Zero
+                        : Library.Utility.Utility.GetRetryDelay(retryDelay, retries, retryWithExponentialBackoff, ex, DateTimeOffset.UtcNow);
+                    if (delay > TimeSpan.Zero)
                     {
-                        var delay = Library.Utility.Utility.GetRetryDelay(retryDelay, retries, retryWithExponentialBackoff);
                         using var ct = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, context.TaskReader.ProgressToken, context.TaskReader.TransferToken, context.TaskReader.StopToken);
                         await Task.Delay(delay, ct.Token).ConfigureAwait(false);
                     }
@@ -567,6 +586,9 @@ partial class BackendManager
                         return;
                     case ListOperation listOp:
                         await ExecuteAsync(listOp, cancellationToken).ConfigureAwait(false);
+                        var listing = listOp.GetResultAsync();
+                        if (listing.IsCompletedSuccessfully && listing.Result.Count > 0)
+                            anyListed = true;
                         return;
                     case QuotaInfoOperation quotaOp:
                         await ExecuteAsync(quotaOp, cancellationToken).ConfigureAwait(false);
@@ -582,6 +604,12 @@ partial class BackendManager
                         return;
                     case GetObjectLockOperation getLockOp:
                         await ExecuteAsync(getLockOp, cancellationToken).ConfigureAwait(false);
+                        return;
+                    case CreateHardLinkOperation linkOp:
+                        await ExecuteAsync(linkOp, cancellationToken).ConfigureAwait(false);
+                        return;
+                    case DeleteFolderOperation deleteFolderOp:
+                        await ExecuteAsync(deleteFolderOp, cancellationToken).ConfigureAwait(false);
                         return;
                     default:
                         throw new NotImplementedException($"Operation type {op.GetType()} is not supported");

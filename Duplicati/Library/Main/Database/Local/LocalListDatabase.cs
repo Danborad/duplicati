@@ -1002,6 +1002,18 @@ namespace Duplicati.Library.Main.Database.Local
         public sealed record FolderEntry(long FileId, string Path, long Size, bool IsDirectory, bool IsSymlink, DateTime LastModified, Dictionary<string, string?>? Metadata) : IListFolderEntry;
 
         /// <summary>
+        /// Gets the number of pages for a paginated result.
+        /// </summary>
+        /// <param name="totalCount">The total number of results, or -1 when it is not counted.</param>
+        /// <param name="limit">The page size, which can be long.MaxValue.</param>
+        /// <returns>The number of pages, or -1 when the total is not counted.</returns>
+        private static int GetTotalPages(long totalCount, long limit)
+            // The count is not rounded up by adding the limit to it, as that overflows for long.MaxValue
+            => totalCount < 0 ? -1
+                : totalCount == 0 ? 0
+                : (int)Math.Min((totalCount - 1) / limit + 1, int.MaxValue);
+
+        /// <summary>
         /// Lists the folder entries for a given fileset and prefix IDs.
         /// </summary>
         /// <param name="prefixIds">The prefix IDs to filter the folder entries.</param>
@@ -1095,9 +1107,10 @@ namespace Duplicati.Library.Main.Database.Local
                 // Only calculate the total for the first query
                 totalCount = -1;
             }
-            else if (results.Count <= limit)
+            else if (results.Count < limit)
             {
-                // If we have all results, we already know the total
+                // A page that is not full holds all the results, so we already know the total.
+                // A full page may have more results after it, so those are counted below
                 totalCount = results.Count;
             }
             else
@@ -1123,7 +1136,7 @@ namespace Duplicati.Library.Main.Database.Local
 
             // Return paginated results
             var intLimit = limit > int.MaxValue ? int.MaxValue : (int)limit;
-            return new PaginatedResults<IListFolderEntry>((int)(offset / limit), (int)intLimit, (int)((totalCount + limit - 1) / limit), totalCount, results);
+            return new PaginatedResults<IListFolderEntry>((int)(offset / limit), (int)intLimit, GetTotalPages(totalCount, limit), totalCount, results);
         }
 
 
@@ -1479,9 +1492,10 @@ namespace Duplicati.Library.Main.Database.Local
                 // Only calculate the total for the first query
                 totalCount = -1;
             }
-            else if (results.Count <= limit)
+            else if (results.Count < limit)
             {
-                // If we have all results, we already know the total
+                // A page that is not full holds all the results, so we already know the total.
+                // A full page may have more results after it, so those are counted below
                 totalCount = results.Count;
             }
             else
@@ -1512,7 +1526,7 @@ namespace Duplicati.Library.Main.Database.Local
             }
 
             var intLimit = limit > int.MaxValue ? int.MaxValue : (int)limit;
-            var totalPages = (int)((totalCount + limit - 1) / limit);
+            var totalPages = GetTotalPages(totalCount, limit);
 
             return new PaginatedResults<IListFileVersion>(
                 (int)(offset / limit),
@@ -1802,11 +1816,14 @@ namespace Duplicati.Library.Main.Database.Local
 
             cmd.SetCommandAndParameters(fetchSql)
                .SetParameterValues(filterProps)
-               .SetParameterValue("@DefaultBehavior", defaultBehavior)
                .SetParameterValue("@FolderBlocksetId", FOLDER_BLOCKSET_ID)
                .SetParameterValue("@SymlinkBlocksetId", SYMLINK_BLOCKSET_ID)
                .SetParameterValue("@limit", limit)
                .SetParameterValue("@offset", offset);
+
+            // The parameter is only in the query when there are filter parts
+            if (caseWhenParts.Count > 0)
+                cmd.SetParameterValue("@DefaultBehavior", defaultBehavior);
 
             if (filesetIdTable != null)
                 await cmd.ExpandInClauseParameterMssqliteAsync("@FilesetIds", filesetIdTable, token)
@@ -1817,7 +1834,8 @@ namespace Duplicati.Library.Main.Database.Local
             {
                 var id = rd.ConvertValueToInt64(0, -1);
                 var version = versionMap[rd.ConvertValueToInt64(1, -1)];
-                var time = new DateTime(rd.ConvertValueToInt64(2, 0), DateTimeKind.Utc);
+                // Fileset timestamps are stored as Unix seconds, unlike the ticks of Lastmodified below
+                var time = ParseFromEpochSeconds(rd.ConvertValueToInt64(2, 0));
                 var path = rd.ConvertValueToString(3) ?? string.Empty;
                 var size = rd.ConvertValueToInt64(4, 0);
                 var isDirectory = rd.GetInt32(5) != 0;
@@ -1835,9 +1853,10 @@ namespace Duplicati.Library.Main.Database.Local
                 // Only calculate the total for the first query
                 totalCount = -1;
             }
-            else if (results.Count <= limit)
+            else if (results.Count < limit)
             {
-                // If we have all results, we already know the total
+                // A page that is not full holds all the results, so we already know the total.
+                // A full page may have more results after it, so those are counted below
                 totalCount = results.Count;
             }
             else
@@ -1856,8 +1875,10 @@ namespace Duplicati.Library.Main.Database.Local
                 ";
 
                 cmd.SetCommandAndParameters(countSql)
-                   .SetParameterValues(filterProps)
-                   .SetParameterValue("@DefaultBehavior", defaultBehavior);
+                   .SetParameterValues(filterProps);
+
+                if (caseWhenParts.Count > 0)
+                    cmd.SetParameterValue("@DefaultBehavior", defaultBehavior);
 
                 if (filesetIdTable != null)
                     await cmd.ExpandInClauseParameterMssqliteAsync("@FilesetIds", filesetIdTable, token)
@@ -1868,7 +1889,7 @@ namespace Duplicati.Library.Main.Database.Local
             }
 
             var intLimit = limit > int.MaxValue ? int.MaxValue : (int)limit;
-            var totalPages = (int)((totalCount + limit - 1) / limit);
+            var totalPages = GetTotalPages(totalCount, limit);
 
             return new PaginatedResults<ISearchFileVersion>(
                 (int)(offset / limit),

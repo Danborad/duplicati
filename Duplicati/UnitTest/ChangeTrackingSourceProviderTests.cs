@@ -178,6 +178,8 @@ public class ChangeTrackingSourceProviderTests : BasicSetupHelper
         ];
         public string MountedPath => _mountPoint;
         public bool NeedsStoredMetadata => false;
+        /// <inheritdoc />
+        public bool NeedsCaseSensitiveFilters => false;
 
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task TestAsync(CancellationToken cancellationToken) => Task.CompletedTask;
@@ -350,6 +352,40 @@ public class ChangeTrackingSourceProviderTests : BasicSetupHelper
         await RunBackupAsync(options);
         Assert.That(Scenario.Current.LoadCalls, Is.EqualTo(1), "The provider should be handed state once per run");
         Assert.That(Scenario.Current.Loaded, Is.Empty, "The first run has no stored state");
+    }
+
+    [Test]
+    [Category("ChangeTracking")]
+    public async Task ItemsDifferingOnlyByCaseAreAllBackedUpAsync()
+    {
+        // Remote sources name their items by case-sensitive ids, so two items in a folder
+        // may differ only by casing, also where the local filesystem ignores case
+        var options = Prepare();
+        Scenario.Current = new Scenario
+        {
+            Children = m =>
+            [
+                Folder(m, "box",
+                    File(m, Path.Combine("box", "AAMkYldDd=.json"), "1"),
+                    File(m, Path.Combine("box", "AAMkYlddD=.json"), "2"),
+                    File(m, Path.Combine("box", "AAMkYlddd=.json"), "3"),
+                    Folder(m, Path.Combine("box", "AAMkYldYg="), File(m, Path.Combine("box", "AAMkYldYg=", "content.eml"), "upper")),
+                    Folder(m, Path.Combine("box", "AAMkYldyg="), File(m, Path.Combine("box", "AAMkYldyg=", "content.eml"), "lower")))
+            ]
+        };
+        await RunBackupAsync(options);
+
+        var paths = await ListPathsAsync(options);
+        Assert.That(paths, Is.SupersetOf(new[]
+        {
+            P(Path.Combine("box", "AAMkYldDd=.json")),
+            P(Path.Combine("box", "AAMkYlddD=.json")),
+            P(Path.Combine("box", "AAMkYlddd=.json")),
+            D(Path.Combine("box", "AAMkYldYg=")),
+            P(Path.Combine("box", "AAMkYldYg=", "content.eml")),
+            D(Path.Combine("box", "AAMkYldyg=")),
+            P(Path.Combine("box", "AAMkYldyg=", "content.eml")),
+        }));
     }
 
     [Test]
@@ -867,6 +903,36 @@ public class ChangeTrackingSourceProviderTests : BasicSetupHelper
         var ex = Assert.ThrowsAsync<UserInformationException>(() => c.BackupAsync([Source]));
         Assert.That(ex!.HelpID, Is.EqualTo("ChangedFilesWithChangeTrackingSource"));
         Assert.That(Scenario.Current.LoadCalls, Is.EqualTo(0), "A refused run hands the provider no state");
+    }
+
+    /// <summary>
+    /// A file that is not enumerated is copied from the previous fileset, so a modification time
+    /// limit that moves with every run would keep files the limit now skips, and miss the ones it
+    /// now lets in
+    /// </summary>
+    [Test]
+    [Category("ChangeTracking")]
+    public void AModificationTimeLimitThatMovesIsRefusedWithATrackedProvider()
+    {
+        var options = Prepare();
+        Scenario.Current = new Scenario { Children = InitialTree, Export = { ["k"] = "v1" } };
+        options["skip-files-modified-after"] = "1W";
+
+        using var c = new Controller("file://" + TARGETFOLDER, options, null);
+        var ex = Assert.ThrowsAsync<UserInformationException>(() => c.BackupAsync([Source]));
+        Assert.That(ex!.HelpID, Is.EqualTo("MovingTimeLimitWithChangeTrackingSource"));
+        Assert.That(Scenario.Current.LoadCalls, Is.EqualTo(0), "A refused run hands the provider no state");
+    }
+
+    [Test]
+    [Category("ChangeTracking")]
+    public async Task AFixedModificationTimeLimitWorksWithATrackedProviderAsync()
+    {
+        var options = Prepare();
+        Scenario.Current = new Scenario { Children = InitialTree, Export = { ["k"] = "v1" } };
+        options["skip-files-modified-before"] = "2000-01-01";
+
+        await RunBackupAsync(options);
     }
 
     [Test]

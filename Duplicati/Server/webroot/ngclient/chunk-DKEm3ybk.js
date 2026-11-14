@@ -1,0 +1,1 @@
+var o=[{path:``,redirectTo:`destination`,pathMatch:`full`},{path:`destination`,loadComponent:()=>import(`./chunk-BxksSu6C.js`)},{path:`encryption`,loadComponent:()=>import(`./chunk-Gs92PZAN.js`)},{path:`select-config`,loadComponent:()=>import(`./chunk-D4f00i8A.js`)}];export{o as default};

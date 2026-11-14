@@ -29,6 +29,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
+using Duplicati.StreamUtil;
 
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
@@ -173,6 +174,10 @@ namespace Duplicati.Library.Backend
 
         /// <inheritdoc/>
         public abstract string ProtocolKey { get; }
+
+        /// <inheritdoc/>
+        // OneDrive and SharePoint paths are case-insensitive
+        public bool HasCaseSensitivePaths => false;
 
         /// <inheritdoc/>
         public abstract string DisplayName { get; }
@@ -402,8 +407,8 @@ namespace Duplicati.Library.Backend
                     CheckResponse(response);
                     using (var responseStream = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken,
                         ct => response.Content.ReadAsStreamAsync(ct)).ConfigureAwait(false))
-                    using (var timeoutSream = responseStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout))
-                        await Utility.Utility.CopyStreamAsync(responseStream, stream, cancelToken).ConfigureAwait(false);
+                    using (var timeoutStream = responseStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
+                        await Utility.Utility.CopyStreamAsync(timeoutStream, stream, cancelToken).ConfigureAwait(false);
                 }
             }
             catch (DriveItemNotFoundException ex)
@@ -444,7 +449,7 @@ namespace Duplicati.Library.Backend
             {
                 await m_retryAfter.WaitForRetryAfterAsync(cancelToken).ConfigureAwait(false);
                 string putUrl = RootItemUrl(drivePrefix, remotename, "content");
-                using (var timeoutStream = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false))
+                using (var timeoutStream = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap))
                 using (var streamContent = new StreamContent(timeoutStream))
                 {
                     streamContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
@@ -502,7 +507,7 @@ namespace Duplicati.Library.Backend
                                     remotename);
 
                                 using (var request = new HttpRequestMessage(HttpMethod.Put, uploadSession.UploadUrl))
-                                using (var timeoutStream = subStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false))
+                                using (var timeoutStream = subStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap))
                                 using (var fragmentContent = new StreamContent(timeoutStream))
                                 {
                                     fragmentContent.Headers.ContentLength = read;
@@ -775,7 +780,7 @@ namespace Duplicati.Library.Backend
         {
             CheckResponse(response);
             using (var responseStream = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => response.Content.ReadAsStreamAsync(ct)).ConfigureAwait(false))
-            using (var timeoutStream = responseStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout))
+            using (var timeoutStream = responseStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
             using (var reader = new StreamReader(timeoutStream))
             {
                 var content = await reader.ReadToEndAsync().ConfigureAwait(false);

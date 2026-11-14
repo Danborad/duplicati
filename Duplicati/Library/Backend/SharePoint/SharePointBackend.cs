@@ -28,6 +28,7 @@ using Microsoft.SharePoint.Client; // Plain 'using' for extension methods
 using System.Runtime.CompilerServices;
 using System.Text;
 using SP = Microsoft.SharePoint.Client;
+using Duplicati.StreamUtil;
 
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
@@ -69,6 +70,12 @@ namespace Duplicati.Library.Backend
         private string? m_spWebUrl;
         /// <summary> Current context to SharePoint web. </summary>
         private ClientContext? m_spContext;
+
+        /// <summary> Creates the context; replaced by tests that have no server. </summary>
+        internal Func<ClientContext>? ContextFactory { get; init; }
+
+        /// <summary> Receives each chunk stream an upload sends; for tests whose context never reads it. </summary>
+        internal Action<Stream>? ChunkStreamCreated { get; init; }
 
         /// <summary> The chunk size for uploading files. </summary>
         private readonly int m_fileChunkSize = 4 << 20; // Default: 4MB
@@ -373,7 +380,7 @@ namespace Duplicati.Library.Backend
         }
 
         /// <summary> Return the preconfigured SP.ClientContext to use. </summary>
-        private async Task<ClientContext> GetSpClientContextAsync(bool forceNewContext, CancellationToken cancelToken)
+        internal async Task<ClientContext> GetSpClientContextAsync(bool forceNewContext, CancellationToken cancelToken)
         {
             if (forceNewContext)
             {
@@ -383,7 +390,9 @@ namespace Duplicati.Library.Backend
 
             if (m_spContext == null)
             {
-                if (m_spWebUrl == null)
+                if (ContextFactory != null)
+                    m_spContext = ContextFactory();
+                else if (m_spWebUrl == null)
                 {
                     (m_spWebUrl, m_spContext) = await FindCorrectWebPathAsync(m_orgUrl, m_userInfo, m_timeouts.ShortTimeout, cancelToken).ConfigureAwait(false);
                     if (m_spWebUrl == null || m_spContext == null)
@@ -406,9 +415,9 @@ namespace Duplicati.Library.Backend
         /// We have to check for the exceptions thrown to know about file /folder existence.
         /// Why the funny guys at MS provided an .Exists field stays a mystery...
         /// </summary>
-        private async Task WrappedExecuteQueryOnContextAsync(ClientContext ctx, string serverRelPathInfo, bool isFolder, TimeSpan timeout, CancellationToken cancelToken)
+        internal async Task WrappedExecuteQueryOnContextAsync(ClientContext ctx, string serverRelPathInfo, bool isFolder, TimeSpan timeout, CancellationToken cancelToken)
         {
-            try { await Utility.Utility.WithTimeout(timeout, cancelToken, _ => ctx.ExecuteQueryAsync()).ConfigureAwait(false); }
+            try { await ExecuteQueryWithTimeoutAsync(ctx, timeout, cancelToken).ConfigureAwait(false); }
             catch (ServerException ex)
             {
                 // funny: If a folder is not found, we still get a FileNotFoundException from Server...?!?
@@ -420,6 +429,51 @@ namespace Duplicati.Library.Backend
                     throw new FileMissingException(Strings.SharePoint.MissingElementError(serverRelPathInfo, m_spWebUrl));
                 else
                     throw;
+            }
+        }
+
+        /// <summary>
+        /// Runs the pending query with a timeout. A query that times out keeps running on the
+        /// context, which is not thread safe, so the context is not handed out again.
+        /// </summary>
+        private async Task ExecuteQueryWithTimeoutAsync(ClientContext ctx, TimeSpan timeout, CancellationToken cancelToken)
+        {
+            try
+            {
+                await Utility.Utility.WithTimeout(timeout, cancelToken, _ => ctx.ExecuteQueryAsync()).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                if (ReferenceEquals(m_spContext, ctx))
+                    m_spContext = null;
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Runs the pending query, which sends the given chunk, until nothing has happened for
+        /// the timeout: the chunk is not being read, and no answer has come. A slow but steady
+        /// upload is not cut off. A query that times out keeps running on the context, so the
+        /// context is not handed out again.
+        /// </summary>
+        /// <param name="ctx">The context with the pending query</param>
+        /// <param name="chunk">The chunk the query sends, observing the gaps between reads</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        private async Task ExecuteQueryWithIdleTimeoutAsync(ClientContext ctx, TimeoutObservingStream chunk, CancellationToken cancelToken)
+        {
+            // The chunk's token is cancelled when the chunk has not been read for the timeout,
+            // which is also the case before the first read and after the last one
+            var idleToken = chunk.TimeoutToken;
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(idleToken, cancelToken);
+            try
+            {
+                await ctx.ExecuteQueryAsync().WaitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (idleToken.IsCancellationRequested && !cancelToken.IsCancellationRequested)
+            {
+                if (ReferenceEquals(m_spContext, ctx))
+                    m_spContext = null;
+                throw new TimeoutException();
             }
         }
 
@@ -569,7 +623,7 @@ namespace Duplicati.Library.Backend
 
             using (var fileInfo = SP.File.OpenBinaryDirect(ctx, fileurl))
             using (var s = fileInfo.Stream)
-            using (var t = s.ObserveReadTimeout(m_timeouts.ReadWriteTimeout))
+            using (var t = s.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
                 await Utility.Utility.CopyStreamAsync(t, stream, true, cancelToken).ConfigureAwait(false);
         }
 
@@ -608,7 +662,7 @@ namespace Duplicati.Library.Backend
             }
 
             if (m_useBinaryDirectMode)
-                using (var ts = stream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false))
+                using (var ts = stream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap))
                     SP.File.SaveBinaryDirect(ctx, fileurl, ts, true);
         }
 
@@ -616,7 +670,7 @@ namespace Duplicati.Library.Backend
         /// Upload in chunks to bypass filesize limit.
         /// https://msdn.microsoft.com/en-us/library/office/dn904536.aspx
         /// </summary>
-        private async Task<SP.File> UploadFileSlicePerSlice(ClientContext ctx, Folder folder, Stream sourceFileStream, string fileName, CancellationToken cancelToken)
+        internal async Task<SP.File> UploadFileSlicePerSlice(ClientContext ctx, Folder folder, Stream sourceFileStream, string fileName, CancellationToken cancelToken)
         {
             // Each sliced upload requires a unique ID.
             var uploadId = Guid.NewGuid();
@@ -643,8 +697,9 @@ namespace Duplicati.Library.Backend
                     bufCnt += lastreadsize;
 
                 using (var contentChunk = new MemoryStream(buf, 0, bufCnt, false))
-                using (var timeoutStream = contentChunk.ObserveReadTimeout(m_timeouts.ReadWriteTimeout))
+                using (var timeoutStream = (TimeoutObservingStream)contentChunk.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap))
                 {
+                    ChunkStreamCreated?.Invoke(timeoutStream);
                     ClientResult<long>? bytesUploaded = null;
                     if (uploadFile == null)
                     {
@@ -678,7 +733,7 @@ namespace Duplicati.Library.Backend
                     if (bytesUploaded == null)
                         ctx.Load(uploadFile, f => f.Length);
 
-                    await ctx.ExecuteQueryAsync().ConfigureAwait(false);
+                    await ExecuteQueryWithIdleTimeoutAsync(ctx, timeoutStream, cancelToken).ConfigureAwait(false);
                     // Check consistency and update fileoffset for the next slice.
                     if (bytesUploaded != null)
                     {
@@ -695,7 +750,7 @@ namespace Duplicati.Library.Backend
                 // End sliced upload by calling FinishUpload.
                 uploadFile = uploadFile.FinishUpload(uploadId, fileoffset, new MemoryStream(0));
                 ctx.Load(uploadFile, f => f.Length);
-                await Utility.Utility.WithTimeout(m_timeouts.ReadWriteTimeout, cancelToken, _ => ctx.ExecuteQueryAsync()).ConfigureAwait(false);
+                await ExecuteQueryWithTimeoutAsync(ctx, m_timeouts.ReadWriteTimeout, cancelToken).ConfigureAwait(false);
             }
 
             if (uploadFile == null)
@@ -772,15 +827,13 @@ namespace Duplicati.Library.Backend
                 if (!remoteFile.Exists)
                     throw new FileMissingException(Strings.SharePoint.MissingElementError(fileurl, m_spWebUrl));
 
-                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, _ =>
-                {
-                    if (m_deleteToRecycler)
-                        remoteFile.Recycle();
-                    else
-                        remoteFile.DeleteObject();
+                // These only add to the pending query, which is sent below
+                if (m_deleteToRecycler)
+                    remoteFile.Recycle();
+                else
+                    remoteFile.DeleteObject();
 
-                    return ctx.ExecuteQueryAsync();
-                }).ConfigureAwait(false);
+                await ExecuteQueryWithTimeoutAsync(ctx, m_timeouts.ShortTimeout, cancellationToken).ConfigureAwait(false);
 
             }
             catch (ServerException) { throw; /* rethrow if Server answered */ }
@@ -827,7 +880,7 @@ namespace Duplicati.Library.Backend
 
                 SP.File remoteFile = ctx.Web.GetFileByServerRelativeUrl(oldFileUrl);
                 remoteFile.MoveTo(newFileUrl, MoveOperations.Overwrite);
-                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, _ => ctx.ExecuteQueryAsync()).ConfigureAwait(false);
+                await ExecuteQueryWithTimeoutAsync(ctx, m_timeouts.ShortTimeout, cancellationToken).ConfigureAwait(false);
             }
             catch (ServerException) { throw; /* rethrow if Server answered */ }
             catch (FileMissingException) { throw; }

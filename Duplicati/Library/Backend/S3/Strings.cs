@@ -54,7 +54,7 @@ namespace Duplicati.Library.Backend.Strings
         public static string S3ArchiveClassesDescriptionShort { get { return LC.L(@"Specify archive storage class"); } }
         public static string S3ArchiveClassesDescriptionLong { get { return LC.L(@"Use this option to specify what storage classes are considered archive storage classes. With this option it is possible to allow lifecycle policies to move data to cheaper storage classes and prevent Duplicati from accessing archived data. This option is only supported for the AWS client."); } }
         public static string DescriptionListApiVersionShort { get { return LC.L(@"Specify the S3 list API version to use"); } }
-        public static string DescriptionListApiVersionLong { get { return LC.L(@"Use this option to specify the S3 list API version to use. This can be used to work around issues with some S3 providers."); } }
+        public static string DescriptionListApiVersionLong { get { return LC.L(@"Use this option to specify the S3 list API version to use. This can be used to work around issues with some S3 providers. If this option is not set, the Minio client uses v2."); } }
         public static string ListApiVersionDeprecated(string legacyOption, string option) { return LC.L(@"The option {0} is deprecated, use {1} instead.", legacyOption, option); }
         public static string DescriptionRecursiveListShort { get { return LC.L(@"Use this option to list all files in the bucket"); } }
         public static string DescriptionRecursiveListLong { get { return LC.L(@"To reduce the number of objects listed, the default is to only list the first level of objects. Use this option to list all objects in the bucket."); } }
@@ -63,7 +63,22 @@ namespace Duplicati.Library.Backend.Strings
         public static string PointInTimeRequiresAwsClientError(string option) { return LC.L(@"Reading the destination at a point in time with --{0} requires the AWS client; set --s3-client=aws", option); }
         public static string S3AuthenticationRegionDescriptionShort { get { return LC.L(@"Specify the authentication region"); } }
         public static string S3AuthenticationRegionDescriptionLong { get { return LC.L(@"Use this option to specify the region used when signing requests. Authentication will use this value or fall back to the location constraint region if not supplied."); } }
+        public static string S3ServerSideEncryptionDescriptionShort { get { return LC.L(@"Request server-side encryption"); } }
+        public static string S3ServerSideEncryptionDescriptionLong(string kmsKeyOption) { return LC.L(@"Use this option to ask the server to encrypt the files it stores, by sending the x-amz-server-side-encryption header with each upload. Use AES256 for keys managed by the server, or aws:kms for keys managed by the key management service, optionally with the key given by --{0}. If this option is not used, the server applies the default encryption of the bucket, if any. This is in addition to the encryption Duplicati does itself.", kmsKeyOption); }
+        public static string S3ServerSideEncryptionKmsKeyIdDescriptionShort { get { return LC.L(@"Key for server-side encryption"); } }
+        public static string S3ServerSideEncryptionKmsKeyIdDescriptionLong(string encryptionOption) { return LC.L(@"Use this option to choose the key management service key that encrypts the files, by its id, alias or ARN. It requires --{0}=aws:kms. If this option is not used, the default key of the account is used.", encryptionOption); }
+        public static string UnknownServerSideEncryptionError(string value, string encryptionOption) { return LC.L(@"The server-side encryption ""{0}"" given by --{1} is not supported, use AES256 or aws:kms.", value, encryptionOption); }
+        public static string KmsKeyWithoutKmsEncryptionError(string kmsKeyOption, string encryptionOption) { return LC.L(@"The option --{0} requires --{1}=aws:kms.", kmsKeyOption, encryptionOption); }
         public static string UnknownS3ClientError(string client) { return LC.L(@"Unknown S3 client: {0}", client); }
+        public static string AssumeRoleArnDescriptionShort { get { return LC.L(@"The role to assume"); } }
+        public static string AssumeRoleArnDescriptionLong(string clientoption) { return LC.L(@"Use this option to access the bucket with a role assumed through STS, given by its ARN, such as arn:aws:iam::123456789012:role/backup. The access key is then only used to assume the role, and the requests are signed with the temporary credentials of the role, which are renewed before they expire. Only the aws client supports this, see --{0}.", clientoption); }
+        public static string AssumeRoleSessionNameDescriptionShort { get { return LC.L(@"The name of the role session"); } }
+        public static string AssumeRoleSessionNameDescriptionLong(string roleoption) { return LC.L(@"Use this option to name the session of the role given with --{0}, which shows in the logs of AWS.", roleoption); }
+        public static string AssumeRoleExternalIdDescriptionShort { get { return LC.L(@"The external id of the role"); } }
+        public static string AssumeRoleExternalIdDescriptionLong(string roleoption) { return LC.L(@"Use this option to give the external id that the trust policy of the role given with --{0} requires.", roleoption); }
+        public static string StsEndpointDescriptionShort { get { return LC.L(@"The STS endpoint"); } }
+        public static string StsEndpointDescriptionLong(string roleoption) { return LC.L(@"Use this option to assume the role given with --{0} through another STS endpoint than the one of AWS, such as the one of a MinIO server, given as a URL. Without it, the global endpoint of AWS is used, or the one of the authentication region.", roleoption); }
+        public static string AssumeRoleNotSupportedByMinioError(string roleoption, string clientoption) { return LC.L(@"The option --{0} is only supported by the aws client. Set --{1}=aws to assume a role.", roleoption, clientoption); }
         public static string NoPathAllowedInEndpointError { get { return LC.L(@"No path allowed in endpoint"); } }
     }
 

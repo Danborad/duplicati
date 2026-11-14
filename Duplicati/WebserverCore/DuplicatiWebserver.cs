@@ -21,6 +21,7 @@
 
 using System.Collections.Concurrent;
 using System.Net;
+using Duplicati.Library.ChangeTracking;
 using System.Net.Security;
 using System.Security.Authentication;
 using System.Text.Json;
@@ -116,7 +117,13 @@ public class DuplicatiWebserver
             Server.Strings.Program.StoretaskconfigLong,
             StoreTaskConfigMode.Auto.ToString(),
             null,
-            Enum.GetNames(typeof(StoreTaskConfigMode)))
+            Enum.GetNames(typeof(StoreTaskConfigMode))),
+        new CommandLineArgument(
+            Server.Runner.FILE_WATCHER_OPTION,
+            CommandLineArgument.ArgumentType.Boolean,
+            Server.Strings.Program.UsefilewatcherShort,
+            Server.Strings.Program.UsefilewatcherLong,
+            "false")
     ];
 
     /// <summary>
@@ -140,7 +147,8 @@ public class DuplicatiWebserver
         int TokenLifetimeInMinutes,
         IEnumerable<string> SPAPaths,
         IEnumerable<string> CorsOrigins,
-        IReadOnlySet<string> PreAuthTokens
+        IReadOnlySet<string> PreAuthTokens,
+        ChangeTrackingSettings ChangeTracking
     );
 
     /// <summary>
@@ -205,18 +213,9 @@ public class DuplicatiWebserver
             opt.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
         });
 
-        // Generate JWTConfig with signing key if not present
-        if (string.IsNullOrWhiteSpace(connection.ApplicationSettings.JWTConfig))
-            connection.ApplicationSettings.JWTConfig = JsonSerializer.Serialize(JWTConfig.Create());
-
-        var jwtConfig = JsonSerializer.Deserialize<JWTConfig>(connection.ApplicationSettings.JWTConfig)
-            ?? throw new Exception("Failed to deserialize JWTConfig");
-
-        if (settings.TokenLifetimeInMinutes > 0)
-            jwtConfig = jwtConfig with { RefreshTokenDurationInMinutes = settings.TokenLifetimeInMinutes };
-
-        if (jwtConfig.PbkdfConfig == null)
-            jwtConfig = jwtConfig with { PbkdfConfig = Server.PbkdfConfig.Default };
+        // Loads the JWTConfig, generating one with a signing key if not present.
+        // The config can be replaced at runtime (e.g. on password change), so consumers must read it through the provider.
+        var jwtConfigProvider = new JWTConfigProvider(connection, settings.TokenLifetimeInMinutes);
 
         if (EnableSwagger)
         {
@@ -249,7 +248,8 @@ public class DuplicatiWebserver
             .AddHttpContextAccessor()
             .AddMemoryCache()
             .AddSingleton<IHostnameValidator>(new HostnameValidator(settings.AllowedHostnames))
-            .AddSingleton(jwtConfig)
+            .AddSingleton<IJWTConfigProvider>(jwtConfigProvider)
+            .AddTransient(sp => sp.GetRequiredService<IJWTConfigProvider>().Current)
             .AddSingleton(new PreAuthTokenConfig(settings.PreAuthTokens))
             .AddAuthorization()
             .AddAuthentication(options => { options.DefaultScheme = "CombinedScheme"; })
@@ -272,10 +272,14 @@ public class DuplicatiWebserver
             })
             .AddJwtBearer("Jwt", options =>
             {
-                options.Authority = jwtConfig.Authority;
-                options.Audience = jwtConfig.Audience;
+                var initialJwtConfig = jwtConfigProvider.Current;
+                options.Authority = initialJwtConfig.Authority;
+                options.Audience = initialJwtConfig.Audience;
                 options.SaveToken = true;
-                options.TokenValidationParameters = JWTTokenProvider.GetTokenValidationParameters(jwtConfig);
+                options.TokenValidationParameters = JWTTokenProvider.GetTokenValidationParameters(initialJwtConfig);
+                // Resolve the key on each validation, so a reset signing key takes effect immediately
+                options.TokenValidationParameters.IssuerSigningKey = null;
+                options.TokenValidationParameters.IssuerSigningKeyResolver = (_, _, _, _) => [jwtConfigProvider.Current.SymmetricSecurityKey()];
                 options.Configuration = new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration();
 
                 options.Events = new JwtBearerEvents
@@ -305,7 +309,7 @@ public class DuplicatiWebserver
         builder.Services.AddHealthChecks()
             .AddCheck("Basic", () => HealthCheckResult.Healthy("Service is running"));
 
-        builder.Services.AddDuplicati(connection, logWriteHandler, applicationSettings);
+        builder.Services.AddDuplicati(connection, logWriteHandler, applicationSettings, settings.ChangeTracking);
 
         // Prevent logs from spamming the console, but allow enabling for debugging
         if (Environment.GetEnvironmentVariable("DUPLICATI_WEBSERVER_LOGGING") != "1")
@@ -316,6 +320,11 @@ public class DuplicatiWebserver
                 .AddFilter("System", LogLevel.Warning)
                 .AddFilter("Duplicati", LogLevel.Warning)
                 .AddFilter("Microsoft.AspNetCore.Diagnostics", LogLevel.None);
+
+            // The event log of Windows has a filter rule of its own, which takes precedence
+            // over the rules above, so the exceptions must be silenced for it separately
+            if (OperatingSystem.IsWindows())
+                builder.Logging.AddFilter<Microsoft.Extensions.Logging.EventLog.EventLogLoggerProvider>("Microsoft.AspNetCore.Diagnostics", LogLevel.None);
         }
 
         builder.Services.AddHttpClient();

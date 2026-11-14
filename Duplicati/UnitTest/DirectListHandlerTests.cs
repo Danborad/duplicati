@@ -106,15 +106,14 @@ namespace Duplicati.UnitTest
             {
                 using (var c = new Controller("file://" + this.TARGETFOLDER, options.Expand(new { version = version }), null))
                 {
+                    // The source file1 brings its folder, which holds the other sources, so that
+                    // folder is the only root (#6863), and the sources are listed in it
                     var files = await c.ListFolderAsync([""], 0, 0, false);
-                    var roots = rootItems(round).Select(x => Path.Combine(this.DATAFOLDER, x.Replace("/", Path.DirectorySeparatorChar.ToString()))).ToArray();
+                    var root = Library.Common.IO.Util.AppendDirSeparator(this.DATAFOLDER);
+                    Assert.That(files.Entries.Items.Select(x => x.Path), Is.EqualTo(new[] { root }));
+                    Assert.That(files.Entries.Items.Single().IsDirectory, Is.True);
 
-                    Assert.That(files.Entries.Items.Count(), Is.EqualTo(roots.Length));
-                    Assert.That(files.Entries.Items.Count(x => x.IsDirectory), Is.EqualTo(roots.Count(x => x.EndsWith(Path.DirectorySeparatorChar))));
-                    Assert.That(files.Entries.Items.Count(x => !x.IsDirectory), Is.EqualTo(roots.Count(x => !x.EndsWith(Path.DirectorySeparatorChar))));
-                    Assert.That(files.Entries.Items.Count(x => roots.Any(y => x.Path.EndsWith(y))), Is.EqualTo(roots.Length));
-
-                    var work = new Queue<string>(roots);
+                    var work = new Queue<string>(new[] { root });
                     while (work.Count > 0)
                     {
                         var path = work.Dequeue();
@@ -129,7 +128,7 @@ namespace Duplicati.UnitTest
                         Assert.That(files2.Entries.Items.Count(x => matches.Contains(x.Path)), Is.EqualTo(matches.Length));
 
                         foreach (var match in matches)
-                            if (match.EndsWith("/"))
+                            if (match.EndsWith(Path.DirectorySeparatorChar))
                                 work.Enqueue(match);
                     }
                 }
@@ -206,6 +205,74 @@ namespace Duplicati.UnitTest
 
                 var withSeparator = await c.ListFolderAsync(new[] { Library.Common.IO.Util.AppendDirSeparator(folder) }, 0, 0, false);
                 Assert.That(withSeparator.Entries.Items.Select(x => x.Path), Is.EquivalentTo(expected), "The folder given with a trailing separator should list the same entries");
+            }
+        }
+
+        /// <summary>
+        /// A backup made on another operating system keeps the paths and separators of that system.
+        /// Its folders are listed when the database is rebuilt from the remote files, as for a direct
+        /// restore, with or without the trailing separator of that system (ngclient#449)
+        /// </summary>
+        [Test]
+        public async Task ListFolder_BackupFromAnotherOperatingSystem_ListsTheEntriesOfAFolderAsync()
+        {
+            var options = new Dictionary<string, string>(this.TestOptions)
+            {
+                ["no-encryption"] = "true"
+            };
+            var sub = Path.Combine(this.DATAFOLDER, "Documents");
+            Directory.CreateDirectory(sub);
+            File.WriteAllText(Path.Combine(sub, "payload.txt"), "payload");
+            File.WriteAllText(Path.Combine(this.DATAFOLDER, "peer.txt"), "peer");
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // The other system: a Windows path below a drive from here, or a Unix path from Windows
+            var otherSeparator = OperatingSystem.IsWindows() ? "/" : "\\";
+            string ToOtherSystem(string path) => OperatingSystem.IsWindows()
+                ? "/other" + path.Replace(":", "").Replace("\\", "/")
+                : "C:" + path.Replace("/", "\\");
+
+            var dlist = Directory.GetFiles(this.TARGETFOLDER, "*.dlist.zip").Single();
+            using (var zip = System.IO.Compression.ZipFile.Open(dlist, System.IO.Compression.ZipArchiveMode.Update))
+            {
+                var entry = zip.GetEntry("filelist.json")!;
+                System.Text.Json.Nodes.JsonArray list;
+                using (var stream = entry.Open())
+                    list = System.Text.Json.Nodes.JsonNode.Parse(stream)!.AsArray();
+                foreach (var item in list)
+                    item!["path"] = ToOtherSystem(item["path"]!.GetValue<string>());
+                entry.Delete();
+                using var output = zip.CreateEntry("filelist.json").Open();
+                System.Text.Json.JsonSerializer.Serialize(output, list);
+            }
+
+            // A direct restore rebuilds the paths only, from the remote files, as the repairupdate endpoint does
+            File.Delete(this.DBFILE);
+            var repairOptions = new Dictionary<string, string>(options)
+            {
+                ["repair-only-paths"] = "true"
+            };
+            using (var c = new Controller("file://" + this.TARGETFOLDER, repairOptions, null))
+                TestUtils.AssertResults(await c.UpdateDatabaseWithVersionsAsync());
+
+            var root = ToOtherSystem(Library.Common.IO.Util.AppendDirSeparator(this.DATAFOLDER));
+            var expected = new[] { root + "Documents" + otherSeparator, root + "peer.txt" };
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var roots = await c.ListFolderAsync(null, 0, 0, false);
+                Assert.That(roots.Entries.Items.Select(x => x.Path), Is.EqualTo(new[] { root }));
+
+                var listed = await c.ListFolderAsync(new[] { root }, 0, 0, false);
+                Assert.That(listed.Entries.Items.Select(x => x.Path), Is.EquivalentTo(expected), "The root of the other system should list its entries");
+
+                var withoutSeparator = await c.ListFolderAsync(new[] { root.Substring(0, root.Length - 1) }, 0, 0, false);
+                Assert.That(withoutSeparator.Entries.Items.Select(x => x.Path), Is.EquivalentTo(expected), "The root without its trailing separator should list the same entries");
+
+                var nested = await c.ListFolderAsync(new[] { root + "Documents" + otherSeparator }, 0, 0, false);
+                Assert.That(nested.Entries.Items.Select(x => x.Path), Is.EqualTo(new[] { root + "Documents" + otherSeparator + "payload.txt" }));
             }
         }
 
@@ -293,6 +360,255 @@ namespace Duplicati.UnitTest
                         Assert.Fail($"Unexpected file {path} in file versions list.");
                 }
             }
+        }
+
+        /// <summary>
+        /// Backs up a folder with report.txt in folder a and in folder b, and notes.txt, twice, with all three
+        /// files changed in between, so each path is in two versions.
+        /// </summary>
+        /// <returns>The paths of the two report files</returns>
+        private async Task<(string InA, string InB)> BackUpTwoVersionsOfTwoReportsAsync(Dictionary<string, string> options)
+        {
+            var inA = Path.Combine(this.DATAFOLDER, "a", "report.txt");
+            var inB = Path.Combine(this.DATAFOLDER, "b", "report.txt");
+            var notes = Path.Combine(this.DATAFOLDER, "notes.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(inA)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(inB)!);
+
+            for (var i = 0; i < 2; i++)
+            {
+                foreach (var file in new[] { inA, inB, notes })
+                    File.WriteAllText(file, $"{file} {i}");
+                using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                    TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+                // Fileset timestamps have a resolution of one second
+                if (i == 0)
+                    await Task.Delay(1500);
+            }
+
+            return (inA, inB);
+        }
+
+        /// <summary>
+        /// Each search row carries the time of the version it is in, the same time list-filesets reports
+        /// for that version. The time used to be the Unix seconds of the fileset read as ticks, a date in year 1.
+        /// </summary>
+        [Test]
+        public async Task SearchEntries_TimeIsTheTimeOfTheVersionAsync()
+        {
+            var options = new Dictionary<string, string>(this.TestOptions) { ["all-versions"] = "true" };
+            var (inA, _) = await BackUpTwoVersionsOfTwoReportsAsync(options);
+
+            using var c = new Controller("file://" + this.TARGETFOLDER, options, null);
+            var filesetTimes = (await c.ListFilesetsAsync()).Filesets.ToDictionary(f => f.Version, f => f.Time);
+            Assert.That(filesetTimes, Has.Count.EqualTo(2));
+            Assert.That(filesetTimes[0], Is.GreaterThan(filesetTimes[1]), "Version 0 is the newest");
+
+            var rows = (await c.SearchEntriesAsync(null, new FilterExpression("*report.txt", true), false, 0, 0, false, false)).FileVersions.Items.ToArray();
+            Assert.That(rows, Has.Length.EqualTo(4));
+            Assert.That(rows.Where(r => r.Path == inA).Select(r => r.Version), Is.EquivalentTo(new long[] { 0, 1 }), "The same path is in both versions");
+
+            foreach (var row in rows)
+            {
+                Assert.That(row.Time.Kind, Is.EqualTo(DateTimeKind.Utc), row.Path);
+                Assert.That(row.Time.ToUniversalTime(), Is.EqualTo(filesetTimes[row.Version].ToUniversalTime()), $"{row.Path} in version {row.Version}");
+                Assert.That(row.Time.Ticks % TimeSpan.TicksPerSecond, Is.EqualTo(0), "Fileset times are whole seconds");
+            }
+        }
+
+        /// <summary>
+        /// The first page of a search reports the total number of matches and pages, also when the page is full.
+        /// Later pages report -1 for both, as the total is only counted for the first page.
+        /// </summary>
+        [Test]
+        [TestCase(1, 4, 4)]
+        [TestCase(3, 4, 2)]
+        [TestCase(4, 4, 1)]
+        [TestCase(5, 4, 1)]
+        public async Task SearchEntries_FirstPageReportsTheTotalAsync(int pageSize, long expectedTotal, int expectedPages)
+        {
+            var options = new Dictionary<string, string>(this.TestOptions) { ["all-versions"] = "true" };
+            await BackUpTwoVersionsOfTwoReportsAsync(options);
+            var filter = new FilterExpression("*report.txt", true);
+
+            using var c = new Controller("file://" + this.TARGETFOLDER, options, null);
+            var all = (await c.SearchEntriesAsync(null, filter, false, 0, 0, false, false)).FileVersions;
+            Assert.That(all.TotalCount, Is.EqualTo(4), "A search without a limit returns everything");
+            Assert.That(all.TotalPages, Is.EqualTo(1), "Everything is on one page");
+            Assert.That(all.Items.Count(), Is.EqualTo(4));
+
+            var seen = new List<(string, long)>();
+            for (var page = 0; page < expectedPages; page++)
+            {
+                var result = (await c.SearchEntriesAsync(null, filter, false, page * pageSize, pageSize, false, false)).FileVersions;
+                Assert.That(result.Page, Is.EqualTo(page));
+                Assert.That(result.PageSize, Is.EqualTo(pageSize));
+                if (page == 0)
+                {
+                    Assert.That(result.TotalCount, Is.EqualTo(expectedTotal), "Total on the first page");
+                    Assert.That(result.TotalPages, Is.EqualTo(expectedPages), "Pages on the first page");
+                }
+                else
+                {
+                    Assert.That(result.TotalCount, Is.EqualTo(-1), "Later pages do not count the total");
+                    Assert.That(result.TotalPages, Is.EqualTo(-1));
+                }
+                seen.AddRange(result.Items.Select(r => (r.Path, r.Version)));
+            }
+
+            Assert.That(seen, Is.EquivalentTo(all.Items.Select(r => (r.Path, r.Version))), "The pages together hold every match once");
+        }
+
+        /// <summary>
+        /// The total of the first page is counted with the same filter, folder scope and version limit as the rows.
+        /// </summary>
+        [Test]
+        public async Task SearchEntries_FirstPageTotalUsesTheFilterFolderAndVersionsAsync()
+        {
+            var allVersions = new Dictionary<string, string>(this.TestOptions) { ["all-versions"] = "true" };
+            var (inA, _) = await BackUpTwoVersionsOfTwoReportsAsync(allVersions);
+            var reports = new FilterExpression("*report.txt", true);
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, allVersions, null))
+            {
+                var everything = (await c.SearchEntriesAsync(null, new FilterExpression("*.txt", true), false, 0, 1, false, false)).FileVersions;
+                Assert.That(everything.TotalCount, Is.EqualTo(6), "Three files in two versions");
+
+                var inFolder = (await c.SearchEntriesAsync(new[] { Path.GetDirectoryName(inA)! }, reports, false, 0, 1, false, false)).FileVersions;
+                Assert.That(inFolder.TotalCount, Is.EqualTo(2), "One file in folder a, in two versions");
+                Assert.That(inFolder.TotalPages, Is.EqualTo(2));
+
+                var none = (await c.SearchEntriesAsync(null, new FilterExpression("*missing.txt", true), false, 0, 1, false, false)).FileVersions;
+                Assert.That(none.TotalCount, Is.EqualTo(0));
+                Assert.That(none.TotalPages, Is.EqualTo(0));
+                Assert.That(none.Items, Is.Empty);
+            }
+
+            var latestOnly = new Dictionary<string, string>(this.TestOptions) { ["version"] = "0" };
+            using (var c = new Controller("file://" + this.TARGETFOLDER, latestOnly, null))
+            {
+                var latest = (await c.SearchEntriesAsync(null, reports, false, 0, 1, false, false)).FileVersions;
+                Assert.That(latest.TotalCount, Is.EqualTo(2), "Two reports in the latest version");
+                Assert.That(latest.TotalPages, Is.EqualTo(2));
+                Assert.That(latest.Items.Single().Version, Is.EqualTo(0));
+            }
+        }
+
+        /// <summary>
+        /// Backs up a folder with four files twice, with every file changed in between,
+        /// so the folder lists four entries and each file is in two versions.
+        /// </summary>
+        /// <returns>The folder and the four files, in path order</returns>
+        private async Task<(string Folder, string[] Files)> BackUpFourFilesTwiceAsync(Dictionary<string, string> options)
+        {
+            var folder = Path.Combine(this.DATAFOLDER, "paged");
+            Directory.CreateDirectory(folder);
+            var files = new[] { "a.txt", "b.txt", "c.txt", "d.txt" }.Select(x => Path.Combine(folder, x)).ToArray();
+
+            for (var i = 0; i < 2; i++)
+            {
+                foreach (var file in files)
+                    File.WriteAllText(file, $"{file} {i}");
+                using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                    TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+                // Fileset timestamps have a resolution of one second
+                if (i == 0)
+                    await Task.Delay(1500);
+            }
+
+            return (Library.Common.IO.Util.AppendDirSeparator(folder), files);
+        }
+
+        /// <summary>
+        /// Checks the paging numbers of each page and that the pages together hold every entry once.
+        /// The first page reports the total entries and pages, also when the page is full;
+        /// later pages report -1 for both, as the total is only counted for the first page.
+        /// </summary>
+        private static async Task AssertPagesAsync<T>(Func<int, Task<Library.Interface.IPaginatedResults<T>>> getPage, int pageSize, long expectedTotal, int expectedPages, IEnumerable<T> all)
+        {
+            var seen = new List<T>();
+            for (var page = 0; page < expectedPages; page++)
+            {
+                var result = await getPage(page);
+                Assert.That(result.Page, Is.EqualTo(page));
+                Assert.That(result.PageSize, Is.EqualTo(pageSize));
+                if (page == 0)
+                {
+                    Assert.That(result.TotalCount, Is.EqualTo(expectedTotal), "Total on the first page");
+                    Assert.That(result.TotalPages, Is.EqualTo(expectedPages), "Pages on the first page");
+                }
+                else
+                {
+                    Assert.That(result.TotalCount, Is.EqualTo(-1), "Later pages do not count the total");
+                    Assert.That(result.TotalPages, Is.EqualTo(-1), "Later pages do not know the pages");
+                }
+                seen.AddRange(result.Items);
+            }
+
+            Assert.That(seen, Is.EquivalentTo(all), "The pages together hold every entry once");
+        }
+
+        [Test]
+        [TestCase(1, 4)]
+        [TestCase(3, 2)]
+        [TestCase(4, 1)]
+        [TestCase(5, 1)]
+        public async Task ListFolder_FirstPageReportsTheTotalAsync(int pageSize, int expectedPages)
+        {
+            var options = new Dictionary<string, string>(this.TestOptions);
+            var (folder, files) = await BackUpFourFilesTwiceAsync(options);
+
+            using var c = new Controller("file://" + this.TARGETFOLDER, options, null);
+            var all = (await c.ListFolderAsync(new[] { folder }, 0, 0, false)).Entries;
+            Assert.That(all.Items.Select(x => x.Path), Is.EqualTo(files), "A listing without a limit returns everything");
+            Assert.That(all.TotalCount, Is.EqualTo(4));
+            Assert.That(all.TotalPages, Is.EqualTo(1), "Everything is on one page");
+
+            await AssertPagesAsync(
+                async page => (await c.ListFolderAsync(new[] { folder }, page * pageSize, pageSize, false)).Entries,
+                pageSize, 4, expectedPages, all.Items);
+        }
+
+        [Test]
+        [TestCase(1, 4)]
+        [TestCase(3, 2)]
+        [TestCase(4, 1)]
+        [TestCase(5, 1)]
+        public async Task ListFileVersions_FirstPageReportsTheTotalAsync(int pageSize, int expectedPages)
+        {
+            var options = new Dictionary<string, string>(this.TestOptions) { ["all-versions"] = "true" };
+            var (_, files) = await BackUpFourFilesTwiceAsync(options);
+            var paths = files.Take(2).ToArray();
+
+            using var c = new Controller("file://" + this.TARGETFOLDER, options, null);
+            var all = (await c.ListFileVersionsAsync(paths, 0, 0)).FileVersions;
+            Assert.That(all.Items.Count(), Is.EqualTo(4), "Two files in two versions");
+            Assert.That(all.TotalCount, Is.EqualTo(4));
+            Assert.That(all.TotalPages, Is.EqualTo(1), "Everything is on one page");
+
+            await AssertPagesAsync(
+                async page => (await c.ListFileVersionsAsync(paths, page * pageSize, pageSize)).FileVersions,
+                pageSize, 4, expectedPages, all.Items);
+        }
+
+        /// <summary>
+        /// The total of the first page of file versions is counted for the selected versions only.
+        /// </summary>
+        [Test]
+        public async Task ListFileVersions_FirstPageTotalUsesTheVersionsAsync()
+        {
+            var allVersions = new Dictionary<string, string>(this.TestOptions) { ["all-versions"] = "true" };
+            var (_, files) = await BackUpFourFilesTwiceAsync(allVersions);
+            var paths = files.Take(2).ToArray();
+
+            var latestOnly = new Dictionary<string, string>(this.TestOptions) { ["version"] = "0" };
+            using var c = new Controller("file://" + this.TARGETFOLDER, latestOnly, null);
+            var latest = (await c.ListFileVersionsAsync(paths, 0, 1)).FileVersions;
+            Assert.That(latest.TotalCount, Is.EqualTo(2), "Two files in the latest version");
+            Assert.That(latest.TotalPages, Is.EqualTo(2));
+            Assert.That(latest.Items.Single().Version, Is.EqualTo(0));
         }
 
         /// <summary>
@@ -418,8 +734,9 @@ namespace Duplicati.UnitTest
                 Assert.That(searchNotes.FileVersions.Items.First().Path.EndsWith("notes.txt"));
 
                 // Simple Search for NOT 'notes'
+                // The folder of the file source file1.txt is recorded too (#6863)
                 var searchNotNotes = await c.SearchEntriesAsync(null, ParseFilters("-notes"), false, 0, 0, false, false);
-                Assert.That(searchNotNotes.FileVersions.Items.Count(), Is.EqualTo(5));
+                Assert.That(searchNotNotes.FileVersions.Items.Count(), Is.EqualTo(6));
                 Assert.That(searchNotNotes.FileVersions.Items.All(x => !x.Path.Contains("notes")), Is.True);
 
                 // Simple Search for 'folder1' folder contents
@@ -434,13 +751,15 @@ namespace Duplicati.UnitTest
                 // Mixed include and exclude
                 var searchMixed = await c.SearchEntriesAsync(null, ParseFilters("+file;-file2"), false, 0, 0, false, false);
                 // Include has precedence over exclude, but we include non-matches as well
-                Assert.That(searchMixed.FileVersions.Items.Count(), Is.EqualTo(6));
+                // (with the folder of file1.txt, #6863)
+                Assert.That(searchMixed.FileVersions.Items.Count(), Is.EqualTo(7));
                 Assert.That(searchMixed.FileVersions.Items.Any(x => x.Path.Contains("file2")), Is.True);
 
                 // Mixed include and exclude
                 var searchMixed2 = await c.SearchEntriesAsync(null, ParseFilters("+file2;-file"), false, 0, 0, false, false);
                 // Include has precedence over exclude, but we include non-matches as well
-                Assert.That(searchMixed2.FileVersions.Items.Count(), Is.EqualTo(4));
+                // (with the folder of file1.txt, #6863)
+                Assert.That(searchMixed2.FileVersions.Items.Count(), Is.EqualTo(5));
                 Assert.That(searchMixed2.FileVersions.Items.Any(x => x.Path.Contains("file2")), Is.True);
 
                 // Mixed include and exclude, wildcards
@@ -678,8 +997,15 @@ namespace Duplicati.UnitTest
 
             using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
             {
+                // The folder of the file sources is recorded too (#6863), so it is the root, and
+                // the sources are listed in it. The roots of the older form, with the files as
+                // roots, are covered by GetMinimalUniquePrefixEntries_FileRootsDoNotAbsorbLongerNamesAsync
                 var roots = await c.ListFolderAsync(null, 0, 0, false);
-                var byPath = roots.Entries.Items.ToDictionary(x => x.Path);
+                var root = Library.Common.IO.Util.AppendDirSeparator(this.DATAFOLDER);
+                Assert.That(roots.Entries.Items.Select(x => x.Path), Is.EqualTo(new[] { root }));
+
+                var listed = await c.ListFolderAsync(new[] { root }, 0, 0, false);
+                var byPath = listed.Entries.Items.ToDictionary(x => x.Path);
 
                 Assert.That(byPath.Keys, Is.EquivalentTo(new[] { notes, notesOld, Library.Common.IO.Util.AppendDirSeparator(folder) }));
                 Assert.That(byPath.Values.Where(x => x.IsDirectory).Select(x => x.Path), Is.EqualTo(new[] { Library.Common.IO.Util.AppendDirSeparator(folder) }));

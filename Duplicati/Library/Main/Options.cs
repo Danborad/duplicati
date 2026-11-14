@@ -46,6 +46,26 @@ namespace Duplicati.Library.Main
         /// The default block hash algorithm
         /// </summary>
         private const string DEFAULT_BLOCK_HASH_ALGORITHM = "SHA256";
+
+        /// <summary>
+        /// The name of the option that makes a sync write each run into its own dated snapshot folder
+        /// </summary>
+        public const string SYNC_SNAPSHOT_FOLDERS_OPTION = "sync-snapshot-folders";
+
+        /// <summary>
+        /// The name of the option that sets how many snapshot folders a snapshot sync keeps
+        /// </summary>
+        public const string SYNC_KEEP_SNAPSHOTS_OPTION = "sync-keep-snapshots";
+
+        /// <summary>
+        /// The name of the option that makes a snapshot sync copy unchanged files instead of hard linking them
+        /// </summary>
+        public const string SYNC_SNAPSHOT_DISABLE_HARDLINKS_OPTION = "sync-snapshot-disable-hardlinks";
+
+        /// <summary>
+        /// The name of the option that makes a sync delete remote files that no longer exist locally
+        /// </summary>
+        public const string SYNC_THEN_DELETE_OPTION = "sync-then-delete";
         /// <summary>
         /// The default file hash algorithm
         /// </summary>
@@ -90,6 +110,11 @@ namespace Duplicati.Library.Main
         /// The default number of concurrent uploads
         /// </summary>
         private const int DEFAULT_ASYNCHRONOUS_UPLOAD_LIMIT = 4;
+
+        /// <summary>
+        /// The default number of concurrent uploads to a local folder
+        /// </summary>
+        private const int DEFAULT_LOCAL_ASYNCHRONOUS_UPLOAD_LIMIT = 1;
 
         /// <summary>
         /// The backends where throttling is disabled by default
@@ -189,6 +214,11 @@ namespace Duplicati.Library.Main
         public static readonly int DEFAULT_RESTORE_VOLUME_DOWNLOADERS = Math.Max(1, Environment.ProcessorCount / 2);
 
         /// <summary>
+        /// The default value for the number of volume downloaders during restore from a local folder
+        /// </summary>
+        private const int DEFAULT_LOCAL_RESTORE_VOLUME_DOWNLOADERS = 1;
+
+        /// <summary>
         /// The default value for the size of the channel buffers during restore
         /// </summary>
         public static readonly int DEFAULT_RESTORE_CHANNEL_BUFFER_SIZE = Environment.ProcessorCount;
@@ -219,6 +249,25 @@ namespace Duplicati.Library.Main
             /// The optimization feature is created, and the backup is aborted if it fails
             /// </summary>
             Required
+        }
+
+        /// <summary>
+        /// The possible settings for the case-sensitivity of filters
+        /// </summary>
+        public enum FilterCaseSensitivityMode
+        {
+            /// <summary>
+            /// The filters follow the case-sensitivity of the client filesystem
+            /// </summary>
+            Default,
+            /// <summary>
+            /// The filters tell paths apart by their casing
+            /// </summary>
+            Sensitive,
+            /// <summary>
+            /// The filters ignore the casing of paths
+            /// </summary>
+            Insensitive
         }
 
         /// <summary>
@@ -346,6 +395,10 @@ namespace Duplicati.Library.Main
         public Options(Dictionary<string, string?> options)
         {
             m_options = new Dictionary<string, string?>(options);
+
+            // The WMI provider used to be called Wmic, and jobs saved with that name must keep using it
+            if (string.Equals(m_options.GetValueOrDefault("snapshot-provider")?.Trim(), "Wmic", StringComparison.OrdinalIgnoreCase))
+                m_options["snapshot-provider"] = nameof(WindowsSnapshotProvider.Wmi);
         }
 
         public Dictionary<string, string?> RawOptions => m_options;
@@ -468,9 +521,12 @@ namespace Duplicati.Library.Main
 
             new CommandLineArgument("throttle-upload", CommandLineArgument.ArgumentType.Size, Strings.Options.ThrottleuploadShort, Strings.Options.ThrottleuploadLong, "0kb"),
             new CommandLineArgument("throttle-download", CommandLineArgument.ArgumentType.Size, Strings.Options.ThrottledownloadShort, Strings.Options.ThrottledownloadLong, "0kb"),
+            new CommandLineArgument("max-upload-per-run", CommandLineArgument.ArgumentType.Size, Strings.Options.MaxUploadPerRunShort, Strings.Options.MaxUploadPerRunLong),
             new CommandLineArgument("throttle-disabled", CommandLineArgument.ArgumentType.Boolean, Strings.Options.DisablethrottleShort, Strings.Options.DisablethrottleLong, "false"),
             new CommandLineArgument("throttle-disabled-backends", CommandLineArgument.ArgumentType.String, Strings.Options.DisablethrottlebackendsShort, Strings.Options.DisablethrottlebackendsLong("throttle-disabled"), DEFAULT_THROTTLE_DISABLED_BACKENDS),
             new CommandLineArgument("skip-files-larger-than", CommandLineArgument.ArgumentType.Size, Strings.Options.SkipfileslargerthanShort, Strings.Options.SkipfileslargerthanLong),
+            new CommandLineArgument("skip-files-modified-before", CommandLineArgument.ArgumentType.DateTime, Strings.Options.SkipfilesmodifiedbeforeShort, Strings.Options.SkipfilesmodifiedbeforeLong),
+            new CommandLineArgument("skip-files-modified-after", CommandLineArgument.ArgumentType.DateTime, Strings.Options.SkipfilesmodifiedafterShort, Strings.Options.SkipfilesmodifiedafterLong),
 
             new CommandLineArgument("upload-unchanged-backups", CommandLineArgument.ArgumentType.Boolean, Strings.Options.UploadUnchangedBackupsShort, Strings.Options.UploadUnchangedBackupsLong, "false"),
 
@@ -502,6 +558,7 @@ namespace Duplicati.Library.Main
             new CommandLineArgument("profile-all-database-queries", CommandLineArgument.ArgumentType.Boolean, Strings.Options.ProfilealldatabasequeriesShort, Strings.Options.ProfilealldatabasequeriesLong, "false"),
             new CommandLineArgument("long-database-query-threshold", CommandLineArgument.ArgumentType.Timespan, Strings.Options.LongdatabasequerythresholdShort, Strings.Options.LongdatabasequerythresholdLong, DEFAULT_LONG_DATABASE_QUERY_THRESHOLD),
             new CommandLineArgument("store-metadata-content-in-database", CommandLineArgument.ArgumentType.Boolean, Strings.Options.StoremetadatacontentindatabaseShort, Strings.Options.StoremetadatacontentindatabaseLong, "false"),
+            new CommandLineArgument(FILTER_CASE_SENSITIVITY_OPTION, CommandLineArgument.ArgumentType.Enumeration, Strings.Options.FiltercasesensitivityShort, Strings.Options.FiltercasesensitivityLong, nameof(FilterCaseSensitivityMode.Default).ToLowerInvariant(), null, Enum.GetNames(typeof(FilterCaseSensitivityMode)).Select(x => x.ToLowerInvariant()).ToArray()),
 
             new CommandLineArgument("list-verify-uploads", CommandLineArgument.ArgumentType.Boolean, Strings.Options.ListverifyuploadsShort, Strings.Options.ListverifyuploadsLong, "false"),
             new CommandLineArgument("allow-sleep", CommandLineArgument.ArgumentType.Boolean, Strings.Options.AllowsleepShort, Strings.Options.AllowsleepLong, "false"),
@@ -538,6 +595,7 @@ namespace Duplicati.Library.Main
             new CommandLineArgument("disable-filepath-cache", CommandLineArgument.ArgumentType.Boolean, Strings.Options.DisablefilepathcacheShort, Strings.Options.DisablefilepathcacheLong, "true", null, null, Strings.Options.DisablefilepathcacheDeprecated),
             new CommandLineArgument("changed-files", CommandLineArgument.ArgumentType.Path, Strings.Options.ChangedfilesShort, Strings.Options.ChangedfilesLong),
             new CommandLineArgument("deleted-files", CommandLineArgument.ArgumentType.Path, Strings.Options.DeletedfilesShort, Strings.Options.DeletedfilesLong("changed-files")),
+            new CommandLineArgument("changed-files-list", CommandLineArgument.ArgumentType.Path, Strings.Options.ChangedfileslistShort, Strings.Options.ChangedfileslistLong("changed-files")),
             new CommandLineArgument("disable-synthetic-filelist", CommandLineArgument.ArgumentType.Boolean, Strings.Options.DisablesyntheticfilelistShort, Strings.Options.DisablesyntehticfilelistLong, "false"),
 
             new CommandLineArgument("threshold", CommandLineArgument.ArgumentType.Integer, Strings.Options.ThresholdShort, Strings.Options.ThresholdLong, DEFAULT_THRESHOLD.ToString()),
@@ -593,6 +651,7 @@ namespace Duplicati.Library.Main
             new CommandLineArgument("disable-on-battery", CommandLineArgument.ArgumentType.Boolean, Strings.Options.DisableOnBatteryShort, Strings.Options.DisableOnBatteryLong, "false"),
 
             new CommandLineArgument("exclude-empty-folders", CommandLineArgument.ArgumentType.Boolean, Strings.Options.ExcludeemptyfoldersShort, Strings.Options.ExcludeemptyfoldersLong, "false"),
+            new CommandLineArgument("one-file-system", CommandLineArgument.ArgumentType.Boolean, Strings.Options.OnefilesystemShort, Strings.Options.OnefilesystemLong, "false"),
             new CommandLineArgument("ignore-filenames", CommandLineArgument.ArgumentType.Path, Strings.Options.IgnorefilenamesShort, Strings.Options.IgnorefilenamesLong, "CACHEDIR.TAG"),
             new CommandLineArgument("restore-symlink-metadata", CommandLineArgument.ArgumentType.Boolean, Strings.Options.RestoresymlinkmetadataShort, Strings.Options.RestoresymlinkmetadataLong, "false"),
             new CommandLineArgument("rebuild-missing-dblock-files", CommandLineArgument.ArgumentType.Boolean, Strings.Options.RebuildmissingdblockfilesShort, Strings.Options.RebuildmissingdblockfilesLong, "false"),
@@ -633,9 +692,13 @@ namespace Duplicati.Library.Main
             new CommandLineArgument(Logging.ReducedReportFormat.OPTION_REDUCED_REPORTING, CommandLineArgument.ArgumentType.Boolean, Strings.Options.ReducedReportingShort, Strings.Options.ReducedReportingLong, "false"),
 
             new CommandLineArgument("sync-recheck", CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncRecheckShort, Strings.Options.SyncRecheckLong, "false"),
-            new CommandLineArgument("sync-then-delete", CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncThenDeleteShort, Strings.Options.SyncThenDeleteLong, "false"),
+            new CommandLineArgument(SYNC_THEN_DELETE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncThenDeleteShort, Strings.Options.SyncThenDeleteLong, "false"),
             new CommandLineArgument("sync-verify-hash", CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncVerifyHashShort, Strings.Options.SyncVerifyHashLong, "false"),
+            new CommandLineArgument("sync-keep-modification-time", CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncKeepModificationTimeShort, Strings.Options.SyncKeepModificationTimeLong, "false"),
             new CommandLineArgument("sync-remote-state", CommandLineArgument.ArgumentType.Enumeration, Strings.Options.SyncRemoteStateShort, Strings.Options.SyncRemoteStateLong, Enum.GetName(typeof(SyncRemoteState), SyncRemoteState.UseRemoteState), null, Enum.GetNames(typeof(SyncRemoteState))),
+            new CommandLineArgument(SYNC_SNAPSHOT_FOLDERS_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncSnapshotFoldersShort, Strings.Options.SyncSnapshotFoldersLong(SYNC_THEN_DELETE_OPTION, SYNC_KEEP_SNAPSHOTS_OPTION, SYNC_SNAPSHOT_DISABLE_HARDLINKS_OPTION), "false"),
+            new CommandLineArgument(SYNC_SNAPSHOT_DISABLE_HARDLINKS_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.SyncSnapshotDisableHardlinksShort, Strings.Options.SyncSnapshotDisableHardlinksLong(SYNC_SNAPSHOT_FOLDERS_OPTION), "false"),
+            new CommandLineArgument(SYNC_KEEP_SNAPSHOTS_OPTION, CommandLineArgument.ArgumentType.Integer, Strings.Options.SyncKeepSnapshotsShort, Strings.Options.SyncKeepSnapshotsLong(SYNC_SNAPSHOT_FOLDERS_OPTION), "0"),
 
             new CommandLineArgument("restore-test-mode", CommandLineArgument.ArgumentType.Enumeration, Strings.Options.RestoreTestModeShort, Strings.Options.RestoreTestModeLong("restore-test-sample-count", "restore-test-sample-percent", "restore-test-rolling-window"), Enum.GetName(typeof(RestoreTestMode), RestoreTestMode.RandomFiles), null, Enum.GetNames(typeof(RestoreTestMode))),
             new CommandLineArgument("restore-test-sample-count", CommandLineArgument.ArgumentType.Integer, Strings.Options.RestoreTestSampleCountShort, Strings.Options.RestoreTestSampleCountLong, DEFAULT_RESTORE_TEST_SAMPLE_COUNT.ToString()),
@@ -699,6 +762,56 @@ namespace Duplicati.Library.Main
                     ? long.MaxValue
                     : Library.Utility.Sizeparser.ParseSize(value, "mb");
             }
+        }
+
+        /// <summary>
+        /// Gets the time before which a file must have been modified to be skipped, in UTC, or <c>null</c> to not skip by time
+        /// </summary>
+        public DateTime? SkipFilesModifiedBefore => GetModifiedTimeLimit("skip-files-modified-before");
+
+        /// <summary>
+        /// Gets the time after which a file must have been modified to be skipped, in UTC, or <c>null</c> to not skip by time
+        /// </summary>
+        public DateTime? SkipFilesModifiedAfter => GetModifiedTimeLimit("skip-files-modified-after");
+
+        /// <summary>
+        /// Gets a value indicating if a modification time limit is given relative to now, such as 1W,
+        /// so it moves with every run and a file can cross it without being changed
+        /// </summary>
+        public bool HasMovingModifiedTimeLimit
+            => IsMovingTimeLimit("skip-files-modified-before") || IsMovingTimeLimit("skip-files-modified-after");
+
+        /// <summary>
+        /// Checks if a point in time depends on when it is read
+        /// </summary>
+        /// <param name="name">The name of the option</param>
+        /// <returns><c>true</c> if the option is set to a time relative to now</returns>
+        private bool IsMovingTimeLimit(string name)
+        {
+            var value = m_options.GetValueOrDefault(name);
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            // "now" is read as the current time, whatever the base time is
+            if (string.Equals(value.Trim(), "now", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // A date is the same from any base time, an interval or a number of seconds is not
+            var start = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Local);
+            return Library.Utility.Timeparser.ParseTimeInterval(value, start, true) != Library.Utility.Timeparser.ParseTimeInterval(value, start.AddDays(1), true);
+        }
+
+        /// <summary>
+        /// Reads a point in time, where an interval such as 1W counts back from now
+        /// </summary>
+        /// <param name="name">The name of the option</param>
+        /// <returns>The time in UTC, or <c>null</c> if the option is not set</returns>
+        private DateTime? GetModifiedTimeLimit(string name)
+        {
+            var value = m_options.GetValueOrDefault(name);
+            return string.IsNullOrWhiteSpace(value)
+                ? null
+                : Library.Utility.Timeparser.ParseTimeInterval(value, DateTime.Now, true).ToUniversalTime();
         }
 
         /// <summary>
@@ -1095,6 +1208,18 @@ namespace Duplicati.Library.Main
         }
 
         /// <summary>
+        /// Gets the number of bytes a backup may upload before it stops after the current file, or zero for no limit
+        /// </summary>
+        public long MaxUploadPerRun
+        {
+            get
+            {
+                var value = m_options.GetValueOrDefault("max-upload-per-run");
+                return string.IsNullOrWhiteSpace(value) ? 0 : Math.Max(0, Library.Utility.Sizeparser.ParseSize(value, "mb"));
+            }
+        }
+
+        /// <summary>
         /// Gets or sets the max download speed in bytes pr. second
         /// </summary>
         public long MaxDownloadPrSecond
@@ -1196,6 +1321,33 @@ namespace Duplicati.Library.Main
             => GetInt("asynchronous-upload-limit", GetInt("asynchronous-concurrent-upload-limit", DEFAULT_ASYNCHRONOUS_UPLOAD_LIMIT));
 
         /// <summary>
+        /// Gets the number of concurrent volume uploads allowed to the given destination. A local folder
+        /// is often an external hard disk, which is slow when several volumes are written to it at once,
+        /// so it gets one upload at a time unless a limit is given (#4808).
+        /// </summary>
+        /// <param name="backendUrl">The URL of the destination</param>
+        /// <returns>The number of concurrent uploads</returns>
+        public int GetAsynchronousConcurrentUploadLimit(string backendUrl)
+        {
+            if (m_options.ContainsKey("asynchronous-upload-limit") || m_options.ContainsKey("asynchronous-concurrent-upload-limit"))
+                return AsynchronousConcurrentUploadLimit;
+
+            string? scheme = null;
+            try
+            {
+                scheme = new Library.Utility.RelaxedUri(backendUrl).Scheme;
+            }
+            catch
+            {
+                // An invalid URL is reported when the backend is loaded
+            }
+
+            return string.Equals(scheme, "file", StringComparison.OrdinalIgnoreCase)
+                ? DEFAULT_LOCAL_ASYNCHRONOUS_UPLOAD_LIMIT
+                : DEFAULT_ASYNCHRONOUS_UPLOAD_LIMIT;
+        }
+
+        /// <summary>
         /// Gets the temporary folder to use for asynchronous transfers
         /// </summary>
         public string AsynchronousUploadFolder => GetString("asynchronous-upload-folder", TempDir);
@@ -1252,7 +1404,7 @@ namespace Duplicati.Library.Main
         /// <value>The log file filter.</value>
         public IFilter? LogFileLogFilter
             => FilterExpression.Combine(
-                new FilterExpression(m_options.GetValueOrDefault("log-file-log-ignore")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)?.Select(x => $"*-{x}"), false),
+                new FilterExpression(m_options.GetValueOrDefault("log-file-log-ignore")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)?.Select(x => $"*-{x}"), false, Library.Utility.Utility.IsFSCaseSensitive),
                 FilterExpression.ParseLogFilter(m_options.GetValueOrDefault("log-file-log-filter"))
             );
 
@@ -1262,7 +1414,7 @@ namespace Duplicati.Library.Main
         /// <value>The log file filter.</value>
         public IFilter? ConsoleLogFilter
             => FilterExpression.Combine(
-                new FilterExpression(m_options.GetValueOrDefault("console-log-ignore")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)?.Select(x => $"*-{x}"), false),
+                new FilterExpression(m_options.GetValueOrDefault("console-log-ignore")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)?.Select(x => $"*-{x}"), false, Library.Utility.Utility.IsFSCaseSensitive),
                 FilterExpression.ParseLogFilter(m_options.GetValueOrDefault("console-log-filter"))
             );
 
@@ -1305,6 +1457,31 @@ namespace Duplicati.Library.Main
         /// A value indicating if metadata content should be stored in the database
         /// </summary>
         public bool StoreMetadataContentInDatabase => GetBool("store-metadata-content-in-database");
+
+        /// <summary>
+        /// The name of the option that sets the case-sensitivity of filters
+        /// </summary>
+        public const string FILTER_CASE_SENSITIVITY_OPTION = "filter-case-sensitivity";
+
+        /// <summary>
+        /// Gets the case-sensitivity setting for filters
+        /// </summary>
+        public FilterCaseSensitivityMode FilterCaseSensitivity
+            => m_options.TryGetValue(FILTER_CASE_SENSITIVITY_OPTION, out var value) && Enum.TryParse<FilterCaseSensitivityMode>(value, true, out var mode)
+                ? mode
+                : FilterCaseSensitivityMode.Default;
+
+        /// <summary>
+        /// Gets a value indicating if filters tell paths apart by their casing.
+        /// Unless the option is set, this follows the case-sensitivity of the client filesystem.
+        /// </summary>
+        public bool FilterCaseSensitive
+            => FilterCaseSensitivity switch
+            {
+                FilterCaseSensitivityMode.Sensitive => true,
+                FilterCaseSensitivityMode.Insensitive => false,
+                _ => Library.Utility.Utility.IsFSCaseSensitive
+            };
 
         /// <summary>
         /// Gets the attribute filter used to exclude files and folders.
@@ -1447,6 +1624,11 @@ namespace Duplicati.Library.Main
         public bool ExcludeEmptyFolders => GetBool("exclude-empty-folders");
 
         /// <summary>
+        /// Gets a flag indicating if folders where another file system is mounted should be left out
+        /// </summary>
+        public bool OneFileSystem => GetBool("one-file-system");
+
+        /// <summary>
         /// Gets a flag indicating if backup exclusion extended attributes should be ignored
         /// </summary>
         public bool DisableBackupExclusionXattr =>
@@ -1505,6 +1687,43 @@ namespace Duplicati.Library.Main
         /// List of files to mark as deleted
         /// </summary>
         public string[]? DeletedFilelist => m_options.GetValueOrDefault("deleted-files")?.Split(new char[] { System.IO.Path.PathSeparator }, StringSplitOptions.RemoveEmptyEntries);
+
+        /// <summary>
+        /// Explains why these options make a change list unusable, or returns null. The server
+        /// asks this before it starts a file watcher, and the engine before it uses a list.
+        /// </summary>
+        /// <returns>The reason, or null</returns>
+        public string? GetChangeListUnsupportedReason()
+        {
+            // The emitted entries are not in tree order, so empty folders cannot be told apart
+            if (ExcludeEmptyFolders)
+                return "empty folders are excluded";
+            // Removing one hard link changes whether another is backed up, which the list does not name
+            if (HardlinkPolicy != HardlinkStrategy.All)
+                return "the hardlink policy is not \"all\"";
+            // A list names paths, but a followed symlink brings in a tree the list does not cover
+            if (SymlinkPolicy == SymlinkStrategy.Follow)
+                return "symlinks are followed";
+            // Alternate data streams are stored as entries of their own, which the list does not name
+            if (EnableAdsBackup)
+                return "alternate data streams are backed up";
+            // The change journal decides what is copied from the previous fileset itself
+            if (UsnStrategy != OptimizationStrategy.Off)
+                return "the USN change journal is in use";
+            return null;
+        }
+
+        /// <summary>
+        /// Gets the path to a file listing the paths that changed since the previous backup, or null if not set
+        /// </summary>
+        public string? ChangedFilesList
+        {
+            get
+            {
+                var value = m_options.GetValueOrDefault("changed-files-list");
+                return string.IsNullOrWhiteSpace(value) ? null : value;
+            }
+        }
 
         /// <summary>
         /// List of filenames that are used to exclude a folder
@@ -2154,6 +2373,33 @@ namespace Duplicati.Library.Main
         public int RestoreVolumeDownloaders => GetInt("restore-volume-downloaders", DEFAULT_RESTORE_VOLUME_DOWNLOADERS);
 
         /// <summary>
+        /// Gets the number of volume downloaders to use when restoring from the given destination. A local
+        /// folder is often an external hard disk, which is slow when several volumes are read from it at once,
+        /// so it gets one downloader unless a number is given (#6829).
+        /// </summary>
+        /// <param name="backendUrl">The URL of the destination, or null if it is not known</param>
+        /// <returns>The number of volume downloaders</returns>
+        public int GetRestoreVolumeDownloaders(string? backendUrl)
+        {
+            if (backendUrl == null || m_options.ContainsKey("restore-volume-downloaders"))
+                return RestoreVolumeDownloaders;
+
+            string? scheme = null;
+            try
+            {
+                scheme = new Library.Utility.RelaxedUri(backendUrl).Scheme;
+            }
+            catch
+            {
+                // An invalid URL is reported when the backend is loaded
+            }
+
+            return string.Equals(scheme, "file", StringComparison.OrdinalIgnoreCase)
+                ? DEFAULT_LOCAL_RESTORE_VOLUME_DOWNLOADERS
+                : RestoreVolumeDownloaders;
+        }
+
+        /// <summary>
         /// Gets the size of the buffer used for the restore channel
         /// </summary>
         public int RestoreChannelBufferSize => GetInt("restore-channel-buffer-size", DEFAULT_RESTORE_CHANNEL_BUFFER_SIZE);
@@ -2187,7 +2433,7 @@ namespace Duplicati.Library.Main
         /// <summary>
         /// Deletes files on the remote that no longer exist locally.
         /// </summary>
-        public bool SyncThenDelete => GetBool("sync-then-delete");
+        public bool SyncThenDelete => GetBool(SYNC_THEN_DELETE_OPTION);
 
         /// <summary>
         /// Verifies file content using SHA-256 hashes when size and time match.
@@ -2195,11 +2441,34 @@ namespace Duplicati.Library.Main
         public bool SyncVerifyHash => GetBool("sync-verify-hash");
 
         /// <summary>
+        /// Records the modification time of the local files on the uploaded files, where the destination supports it.
+        /// Defaults to true unless explicitly disabled.
+        /// </summary>
+        public bool SyncKeepModificationTime => !m_options.ContainsKey("sync-keep-modification-time") || GetBool("sync-keep-modification-time");
+
+        /// <summary>
         /// Controls how the sync operation determines the remote state of each folder:
         /// enumerate the remote destination, consult the local database, or upload
         /// blindly. See <see cref="SyncRemoteState"/> for the trade-offs.
         /// </summary>
         public SyncRemoteState SyncRemoteState => GetEnum("sync-remote-state", SyncRemoteState.UseRemoteState);
+
+        /// <summary>
+        /// Writes each sync run into its own dated snapshot folder below the destination
+        /// instead of mirroring into the destination root.
+        /// </summary>
+        public bool SyncSnapshotFolders => GetBool(SYNC_SNAPSHOT_FOLDERS_OPTION);
+
+        /// <summary>
+        /// The number of snapshot folders a snapshot sync keeps; zero keeps all of them.
+        /// </summary>
+        public int SyncKeepSnapshots => Math.Max(0, GetInt(SYNC_KEEP_SNAPSHOTS_OPTION, 0));
+
+        /// <summary>
+        /// Makes a snapshot sync copy unchanged files into each snapshot instead of hard
+        /// linking them from the previous snapshot.
+        /// </summary>
+        public bool SyncSnapshotDisableHardlinks => GetBool(SYNC_SNAPSHOT_DISABLE_HARDLINKS_OPTION);
 
         /// <summary>
         /// Class for handling a single RetentionPolicy timeframe-interval-pair

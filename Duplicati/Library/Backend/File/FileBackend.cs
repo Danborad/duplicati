@@ -24,6 +24,7 @@ using Duplicati.Library.Interface;
 using Duplicati.Library.Utility;
 using Duplicati.Library.Utility.Options;
 using System.Runtime.CompilerServices;
+using Duplicati.StreamUtil;
 
 namespace Duplicati.Library.Backend
 {
@@ -32,7 +33,7 @@ namespace Duplicati.Library.Backend
     /// <summary>
     /// The file backend implementation
     /// </summary>
-    public class File : IBackend, IStreamingBackend, IQuotaEnabledBackend, IRenameEnabledBackend, IFolderEnabledBackend, ISetTimestampBackend
+    public class File : IBackend, IStreamingBackend, IQuotaEnabledBackend, IRenameEnabledBackend, IFolderEnabledBackend, ILinkEnabledBackend, IFolderDeleteEnabledBackend, IModificationTimeEnabledBackend, ISetTimestampBackend
     {
         /// <summary>
         /// The option key for the destination marker file
@@ -128,12 +129,14 @@ namespace Duplicati.Library.Backend
                 path = systemIO.PathGetFullPath(path);
 
             var altPaths = options.GetValueOrDefault(OPTION_ALTERNATE_PATHS);
-            if (!string.IsNullOrWhiteSpace(altPaths))
+            var markerfile = options.GetValueOrDefault(OPTION_DESTINATION_MARKER);
+            // A marker alone guards the one path, such as a mount point that exists while the share is not mounted
+            if (!string.IsNullOrWhiteSpace(altPaths) || !string.IsNullOrWhiteSpace(markerfile))
             {
                 List<string> paths =
                 [
                     path,
-                    .. altPaths.Split(new string[] {Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries),
+                    .. (altPaths ?? "").Split(new string[] {Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries),
                 ];
 
                 //On windows we expand the drive letter * to all drives
@@ -155,7 +158,6 @@ namespace Duplicati.Library.Backend
 
                 //If there is a marker file, we do not allow the primary target path
                 // to be accepted, unless it contains the marker file
-                var markerfile = options.GetValueOrDefault(OPTION_DESTINATION_MARKER);
                 if (!string.IsNullOrWhiteSpace(markerfile))
                     path = null;
 
@@ -242,6 +244,10 @@ namespace Duplicati.Library.Backend
 
         /// <inheritdoc />
         public virtual string ProtocolKey => "file";
+
+        /// <inheritdoc/>
+        // The local filesystem follows the operating system, which is the default
+        public bool HasCaseSensitivePaths => false;
 
         public bool SupportsStreaming => !m_moveFile;
 
@@ -393,7 +399,7 @@ namespace Duplicati.Library.Backend
                 string targetFilePath = GetRemoteName(targetFilename);
                 long copiedBytes = 0;
                 using (var targetStream = systemIO.FileCreate(targetFilePath))
-                using (var timeoutStream = targetStream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout))
+                using (var timeoutStream = targetStream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
                 {
                     var buf = new byte[1024 * 1024];
                     copiedBytes = await Utility.Utility.CopyStreamAsync(sourceStream, timeoutStream, true, cancelToken, buf).ConfigureAwait(false);
@@ -411,13 +417,38 @@ namespace Duplicati.Library.Backend
 #endif
 
         /// <inheritdoc />
+        public async Task PutAsync(string targetFilename, Stream sourceStream, DateTime lastModifiedUtc, CancellationToken cancelToken)
+        {
+            await PutAsync(targetFilename, sourceStream, cancelToken).ConfigureAwait(false);
+            try
+            {
+                var utcTime = lastModifiedUtc.Kind == DateTimeKind.Local ? lastModifiedUtc.ToUniversalTime() : lastModifiedUtc;
+                var targetFilePath = GetRemoteName(targetFilename);
+                systemIO.FileSetLastWriteTimeUtc(targetFilePath, utcTime);
+                try
+                {
+                    systemIO.FileSetCreationTimeUtc(targetFilePath, utcTime);
+                }
+                catch
+                {
+                    // Creation time may not be supported on all filesystems/platforms; ignore failure
+                }
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
+        }
+
+        /// <inheritdoc />
         public async Task GetAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
             try
             {
                 // FileOpenRead has flags System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read
                 using (var readstream = systemIO.FileOpenRead(GetRemoteName(remotename)))
-                using (var timeoutStream = readstream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout))
+                using (var timeoutStream = readstream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
                     await Utility.Utility.CopyStreamAsync(timeoutStream, stream, true, cancelToken).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -614,6 +645,51 @@ namespace Duplicati.Library.Backend
             systemIO.FileMove(source, target);
 
             return Task.CompletedTask;
+        }
+
+        /// <inheritdoc />
+        public async Task CreateHardLinkAsync(string existingName, string targetName, CancellationToken cancellationToken)
+        {
+            PreAuthenticate();
+
+            if (!systemIO.DirectoryExists(m_path))
+                throw new FolderMissingException(Strings.FileBackend.FolderMissingError(m_path));
+
+            // Both names come from the caller and are resolved under the backend root, so
+            // a link can neither read from nor write to a place outside the destination.
+            var source = ResolveContainedPath(SanitizeFilename(existingName));
+            var target = ResolveContainedPath(SanitizeFilename(targetName));
+
+            try
+            {
+                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, _
+                    => systemIO.FileCreateHardLink(source, target)
+                ).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task DeleteFolderRecursiveAsync(string path, CancellationToken cancellationToken)
+        {
+            PreAuthenticate();
+
+            if (string.IsNullOrWhiteSpace(path))
+                throw new ArgumentException("Refusing to delete the backend root folder", nameof(path));
+
+            var folder = ResolveContainedPath(SanitizeFilename(path));
+            if (string.Equals(systemIO.PathGetFullPath(folder).TrimEnd(System.IO.Path.DirectorySeparatorChar), systemIO.PathGetFullPath(m_path).TrimEnd(System.IO.Path.DirectorySeparatorChar), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                throw new ArgumentException("Refusing to delete the backend root folder", nameof(path));
+            if (!systemIO.DirectoryExists(folder))
+                return;
+
+            await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, _
+                => systemIO.DirectoryDelete(folder, true)
+            ).ConfigureAwait(false);
         }
 
         /// <summary>

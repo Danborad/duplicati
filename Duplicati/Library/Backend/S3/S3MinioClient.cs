@@ -29,6 +29,7 @@ using Minio;
 using Minio.DataModel.Args;
 using Minio.DataModel.ObjectLock;
 using Minio.Exceptions;
+using Duplicati.StreamUtil;
 
 namespace Duplicati.Library.Backend
 {
@@ -41,6 +42,14 @@ namespace Duplicati.Library.Backend
         private readonly string m_dnsHost;
         private readonly TimeoutOptionsHelper.Timeouts m_timeouts;
         private readonly string m_lockMode;
+        /// <summary>
+        /// Whether to use the v1 list API; null keeps the Minio default (v2)
+        /// </summary>
+        private readonly bool? m_useV1ListApi;
+        /// <summary>
+        /// The headers that request server-side encryption of a written object, empty for none
+        /// </summary>
+        private readonly Dictionary<string, string> m_encryptionHeaders = new();
 
         public S3MinioClient(string awsID, string awsKey, string? locationConstraint,
             string servername, string? storageClass, bool useSSL, TimeoutOptionsHelper.Timeouts timeouts, Dictionary<string, string?> options, string lockMode, string? authenticationRegion)
@@ -48,6 +57,16 @@ namespace Duplicati.Library.Backend
             m_timeouts = timeouts;
             m_locationConstraint = locationConstraint;
             m_lockMode = lockMode;
+
+            var listApiVersion = options.GetValueOrDefault(S3AwsClient.S3_LIST_API_VERSION_OPTION) ?? options.GetValueOrDefault(S3AwsClient.S3_LEGACY_LIST_API_VERSION_OPTION);
+            if (!string.IsNullOrWhiteSpace(listApiVersion))
+                m_useV1ListApi = !string.Equals(listApiVersion, "v2", StringComparison.OrdinalIgnoreCase);
+
+            var (sseMethod, sseKmsKeyId) = S3AwsClient.ParseServerSideEncryption(options);
+            if (sseMethod != null)
+                m_encryptionHeaders["x-amz-server-side-encryption"] = sseMethod;
+            if (sseKmsKeyId != null)
+                m_encryptionHeaders["x-amz-server-side-encryption-aws-kms-key-id"] = sseKmsKeyId;
 
             var clientBuilder = new MinioClient()
                 .WithEndpoint(servername)
@@ -130,9 +149,13 @@ namespace Duplicati.Library.Backend
             if (!string.IsNullOrWhiteSpace(prefix))
                 prefix = Util.AppendDirSeparator(prefix, "/");
 
+            var args = new ListObjectsArgs().WithBucket(bucketName).WithPrefix(prefix).WithRecursive(recursive);
+            if (m_useV1ListApi.HasValue)
+                args = args.WithListObjectsV1(m_useV1ListApi.Value);
+
             // The requests run while the observable is read, and must stop when the listing does
             using var listing = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var observable = m_client.ListObjectsAsync(new ListObjectsArgs().WithBucket(bucketName).WithPrefix(prefix).WithRecursive(recursive), listing.Token);
+            var observable = m_client.ListObjectsAsync(args, listing.Token);
 
             try
             {
@@ -214,7 +237,7 @@ namespace Duplicati.Library.Backend
             try
             {
                 await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct
-                    => m_client.CopyObjectAsync(new CopyObjectArgs().WithBucket(bucketName).WithObject(target).WithCopyObjectSource(new CopySourceObjectArgs().WithBucket(bucketName).WithObject(source)), cancellationToken: ct)
+                    => m_client.CopyObjectAsync(new CopyObjectArgs().WithBucket(bucketName).WithObject(target).WithHeaders(m_encryptionHeaders).WithCopyObjectSource(new CopySourceObjectArgs().WithBucket(bucketName).WithObject(source)), cancellationToken: ct)
                 ).ConfigureAwait(false);
             }
             catch (MinioException e)
@@ -245,7 +268,7 @@ namespace Duplicati.Library.Backend
                 await m_client.GetObjectAsync(new GetObjectArgs().WithBucket(bucketName).WithObject(keyName).WithCallbackStream(
                     (stream) =>
                     {
-                        using var t = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout);
+                        using var t = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
                         Utility.Utility.CopyStream(t, target);
                     })).ConfigureAwait(false);
             }
@@ -272,13 +295,14 @@ namespace Duplicati.Library.Backend
 
             try
             {
-                using var t = source.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false);
+                using var t = source.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
                 await m_client.PutObjectAsync(new PutObjectArgs()
                     .WithBucket(bucketName)
                     .WithObject(keyName)
                     .WithStreamData(t)
                     .WithObjectSize(t.Length)
-                    .WithContentType("application/octet-stream"),
+                    .WithContentType("application/octet-stream")
+                    .WithHeaders(m_encryptionHeaders),
                     cancellationToken: cancelToken);
             }
             catch (MinioException e)
@@ -286,6 +310,7 @@ namespace Duplicati.Library.Backend
                 Logging.Log.WriteErrorMessage(Logtag, "ErrorPuttingObjectMinio", null,
                     "Error putting object {0} to {1} using Minio: {2}",
                     keyName, bucketName, e.ToString());
+                throw;
             }
         }
 

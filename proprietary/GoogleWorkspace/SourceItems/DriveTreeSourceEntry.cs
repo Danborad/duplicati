@@ -59,8 +59,8 @@ internal class DriveTreeSourceEntry(SourceProvider provider, string parentPath, 
     /// The change tracking key of the drive
     /// </summary>
     private string StateKey => driveId == null
-        ? ChangeTrackingKeys.MyDrive(userId ?? throw new InvalidOperationException("My Drive is listed without a user"))
-        : ChangeTrackingKeys.SharedDrive(userId, driveId);
+        ? ChangeTrackingKeys.MyDrive(provider.ChangeTrackingUserScope(userId ?? throw new InvalidOperationException("My Drive is listed without a user")))
+        : ChangeTrackingKeys.SharedDrive(userId == null ? provider.ChangeTrackingSharedDriveScope(driveId) : provider.ChangeTrackingUserScope(userId), driveId);
 
     public override async IAsyncEnumerable<ISourceProviderEntry> Enumerate([EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -555,7 +555,8 @@ internal class DriveTreeSourceEntry(SourceProvider provider, string parentPath, 
             { "gsuite:v", "1" },
             { "gsuite:Type", SourceItemType.DriveFolder.ToString() },
             { "gsuite:Name", name },
-            { "gsuite:Id", folderId }
+            { "gsuite:Id", folderId },
+            { "gsuite:UserId", userId }
         }
         .Where(kv => !string.IsNullOrEmpty(kv.Value))
         .ToDictionary(kv => kv.Key, kv => kv.Value));

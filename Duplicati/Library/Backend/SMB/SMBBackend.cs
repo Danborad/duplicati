@@ -36,10 +36,14 @@ namespace Duplicati.Library.Backend;
 /// <summary>
 /// Native CIFS/SMB Backend implementation
 /// </summary>
-public class SMBBackend : IStreamingBackend, IFolderEnabledBackend, IRenameEnabledBackend
+public class SMBBackend : IStreamingBackend, IFolderEnabledBackend, IRenameEnabledBackend, ILinkEnabledBackend, IFolderDeleteEnabledBackend
 {
     /// <inheritdoc/>
     public virtual string ProtocolKey => "smb";
+
+    /// <inheritdoc/>
+    // The casing rules are those of the share, which is not known
+    public bool HasCaseSensitivePaths => false;
 
     /// <inheritdoc/>
     public virtual string DisplayName => Strings.SMBBackend.DisplayName;
@@ -74,6 +78,11 @@ public class SMBBackend : IStreamingBackend, IFolderEnabledBackend, IRenameEnabl
     /// Shared connection between all methods to avoid re-authentication
     /// </summary>
     private SMBShareConnection? _sharedConnection;
+
+    /// <summary>
+    /// Creates the connection; replaced by tests that have no server
+    /// </summary>
+    internal Func<CancellationToken, Task<SMBShareConnection>>? ConnectionFactory { get; init; }
 
     /// <summary>
     /// Read buffer size for SMB operations (will be capped automatically by SMB negotiated values)
@@ -360,7 +369,16 @@ public class SMBBackend : IStreamingBackend, IFolderEnabledBackend, IRenameEnabl
     /// </summary>
     /// <returns>An SMB connection that can be used for file operations</returns>
     private async Task<SMBShareConnection> GetConnectionAsync(CancellationToken cancellationToken)
-        => _sharedConnection ??= await SMBShareConnection.CreateAsync(_connectionParameters, _timeouts, cancellationToken).ConfigureAwait(false);
+    {
+        // A connection is closed for good when an operation on it timed out
+        if (_sharedConnection?.IsBroken == true)
+        {
+            _sharedConnection.Dispose();
+            _sharedConnection = null;
+        }
+
+        return _sharedConnection ??= await (ConnectionFactory?.Invoke(cancellationToken) ?? SMBShareConnection.CreateAsync(_connectionParameters, _timeouts, cancellationToken)).ConfigureAwait(false);
+    }
 
 
 
@@ -398,6 +416,53 @@ public class SMBBackend : IStreamingBackend, IFolderEnabledBackend, IRenameEnabl
     {
         var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
         await con.RenameAsync(oldname, newname, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task DeleteFolderRecursiveAsync(string path, CancellationToken cancellationToken)
+    {
+        // Only a relative path below the configured folder is accepted, so the delete
+        // cannot reach the configured folder itself or anything outside it.
+        var segments = (path ?? "").Split('/');
+        if (string.IsNullOrWhiteSpace(path) || path.StartsWith('/') || segments.Any(x => x is "" or "." or ".." || x.Contains('\\')))
+            throw new ArgumentException($"Refusing to delete the folder \"{path}\"", nameof(path));
+
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await DeleteTreeAsync(con, path, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Deletes a folder after deleting everything below it.
+    /// </summary>
+    /// <param name="con">The connection</param>
+    /// <param name="folder">The folder, relative to the configured path</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    private async Task DeleteTreeAsync(SMBShareConnection con, string folder, CancellationToken cancellationToken)
+    {
+        var children = new List<(string Path, bool IsFolder)>();
+        await foreach (var entry in ListAsync(folder, cancellationToken).ConfigureAwait(false))
+        {
+            var name = entry.Name.TrimEnd('/', '\\');
+            if (!string.IsNullOrEmpty(name))
+                children.Add((folder + "/" + name, entry.IsFolder));
+        }
+
+        foreach (var (childPath, isFolder) in children)
+        {
+            if (isFolder)
+                await DeleteTreeAsync(con, childPath, cancellationToken).ConfigureAwait(false);
+            else
+                await con.DeleteAsync(childPath, cancellationToken).ConfigureAwait(false);
+        }
+
+        await con.DeleteDirectoryAsync(folder, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task CreateHardLinkAsync(string existingName, string targetName, CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.CreateHardLinkAsync(existingName, targetName, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>

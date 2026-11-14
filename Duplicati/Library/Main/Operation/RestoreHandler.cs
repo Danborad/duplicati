@@ -49,6 +49,10 @@ namespace Duplicati.Library.Main.Operation
         private byte[]? m_blockbuffer;
         private readonly RestoreResults m_result;
         private string? m_selectedRestoreFolder;
+        /// <summary>
+        /// The URL of the destination being restored from, or null if the caller did not give it
+        /// </summary>
+        private string? m_backendUrl;
 
         /// <summary>
         /// When non-null, names a persistent scratch table (in the local database file) that
@@ -193,6 +197,7 @@ namespace Duplicati.Library.Main.Operation
         public async Task RunAsync(string[] paths, IBackendManager backendManager, Library.Utility.IFilter? filter, IRestoreDestinationProvider restoreDestination, string? backendUrl = null)
         {
             m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Restore_Begin);
+            m_backendUrl = backendUrl;
 
             // Check tempdir free space before starting restore
             CheckTempDirFreeSpace();
@@ -245,8 +250,19 @@ namespace Duplicati.Library.Main.Operation
                         throw new InvalidOperationException("Unexpected empty database path");
                     db = await LocalRestoreDatabase.CreateAsync(dbpath, null, m_result.TaskControl.ProgressToken)
                         .ConfigureAwait(false);
+
+                    // A partially recreated database, such as the one rebuilt with the paths only to
+                    // browse a backup for a direct restore, may have no record of the block volumes,
+                    // so it cannot restore. A temporary database is built instead, as when there is none
+                    if (await db.PartiallyRecreatedAsync(m_result.TaskControl.ProgressToken).ConfigureAwait(false))
+                    {
+                        Logging.Log.WriteInformationMessage(LOGTAG, "PartiallyRecreatedDatabase", "The local database was only partially recreated, building a temporary database");
+                        await db.DisposeAsync().ConfigureAwait(false);
+                        db = null;
+                    }
                 }
-                else
+
+                if (db == null)
                 {
                     Logging.Log.WriteInformationMessage(LOGTAG, "NoLocalDatabase", "No local database, building a temporary database");
                     tmpdb = new TempFile();
@@ -274,10 +290,15 @@ namespace Duplicati.Library.Main.Operation
                 // knows the timestamp (the --restore-all-files path), it is used directly.
                 var (restoreVersion, restoreBackupTimestamp) = await ResolveRestoreVersionAndTimestampAsync(db, versions, time, cancellationToken).ConfigureAwait(false);
 
+                // A temporary database was just built from the remote list, so it can only differ
+                // from the destination by files a concurrent backup has uploaded since. Verifying
+                // would report those as unknown files and fail the restore.
+                var verifyRemoteList = tmpdb == null && !m_options.NoBackendverification;
+
                 if (m_options.RestoreLegacy)
-                    await DoRunAsync(backendManager, db, filter, restoreDestination, restoreVersion, restoreBackupTimestamp, cancellationToken).ConfigureAwait(false);
+                    await DoRunAsync(backendManager, db, filter, restoreDestination, restoreVersion, restoreBackupTimestamp, verifyRemoteList, cancellationToken).ConfigureAwait(false);
                 else
-                    await DoRunNewAsync(backendManager, db, filter, restoreDestination, restoreVersion, restoreBackupTimestamp, cancellationToken).ConfigureAwait(false);
+                    await DoRunNewAsync(backendManager, db, filter, restoreDestination, restoreVersion, restoreBackupTimestamp, verifyRemoteList, cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -529,7 +550,7 @@ namespace Duplicati.Library.Main.Operation
 
             public string TargetDestination => _targetDestination;
             public Task Initialize(CancellationToken cancel) => _inner.Initialize(cancel);
-            public Task Finalize(Action<double>? progressCallback, CancellationToken cancel) => _inner.Finalize(progressCallback, cancel);
+            public Task Finalize(Action<double>? progressCallback, bool isComplete, CancellationToken cancel) => _inner.Finalize(progressCallback, isComplete, cancel);
             public Task Test(CancellationToken cancellationToken) => _inner.Test(cancellationToken);
             public Task<bool> CreateFolderIfNotExists(string path, CancellationToken cancel) => _inner.CreateFolderIfNotExists(path, cancel);
             public Task<bool> FileExists(string path, CancellationToken cancel) => _inner.FileExists(path, cancel);
@@ -714,11 +735,14 @@ namespace Duplicati.Library.Main.Operation
                         var written = await ApplyMetadataAsync(targetpath, metadata, options, restoreDestination, false, sourceUsesWindowsSeparators, cancellationToken).ConfigureAwait(false);
 
                         // A symbolic link has no data, so it is made here and nowhere else.
-                        // Count it as the new restore engine does, as a file.
+                        // Count it as the new restore engine does, as a file and as a link.
                         if (metadata != null && metadata.TryGetValue("CoreSymlinkTarget", out var symlinkTarget) && !string.IsNullOrWhiteSpace(symlinkTarget))
                         {
                             if (written)
+                            {
                                 result.RestoredFiles++;
+                                result.RestoredSymlinks++;
+                            }
                             else
                                 result.UnmodifiedFiles++;
                         }
@@ -876,8 +900,9 @@ namespace Duplicati.Library.Main.Operation
         /// <param name="restoreDestination">The destination to restore to.</param>
         /// <param name="restoreVersion">The forwarded 0-based backup version index being restored (0 = newest), reported to restore callback modules.</param>
         /// <param name="restoreBackupTimestamp">The forwarded backup timestamp (UTC) being restored, reported to restore callback modules.</param>
+        /// <param name="verifyRemoteList">True to verify the remote list against the database before restoring.</param>
         /// <param name="cancellationToken">The cancellation token to monitor for cancellation requests.</param>
-        private async Task DoRunNewAsync(IBackendManager backendManager, LocalRestoreDatabase database, IFilter? filter, IRestoreDestinationProvider restoreDestination, long restoreVersion, DateTime restoreBackupTimestamp, CancellationToken cancellationToken)
+        private async Task DoRunNewAsync(IBackendManager backendManager, LocalRestoreDatabase database, IFilter? filter, IRestoreDestinationProvider restoreDestination, long restoreVersion, DateTime restoreBackupTimestamp, bool verifyRemoteList, CancellationToken cancellationToken)
         {
             // Perform initial setup
             await Utility.UpdateOptionsFromDbAsync(database, m_options, cancellationToken)
@@ -891,11 +916,12 @@ namespace Duplicati.Library.Main.Operation
                 throw new UserInformationException("Restore volume decryptors must be greater than 0", "RestoreVolumeDecryptorsTooSmall");
             if (m_options.RestoreVolumeDecompressors <= 0)
                 throw new UserInformationException("Restore volume decompressors must be greater than 0", "RestoreVolumeDecompressorsTooSmall");
-            if (m_options.RestoreVolumeDownloaders <= 0)
+            var volumeDownloaderCount = m_options.GetRestoreVolumeDownloaders(m_backendUrl);
+            if (volumeDownloaderCount <= 0)
                 throw new UserInformationException("Restore volume downloaders must be greater than 0", "RestoreVolumeDownloadersTooSmall");
 
             // Verify the backend if necessary
-            if (!m_options.NoBackendverification)
+            if (verifyRemoteList)
             {
                 m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Restore_PreRestoreVerify);
                 await FilelistProcessor.VerifyRemoteListAsync(backendManager, m_options, database, m_result.BackendWriter, latestVolumesOnly: false, verifyMode: FilelistProcessor.VerifyMode.VerifyOnly, cancellationToken).ConfigureAwait(false);
@@ -953,7 +979,7 @@ namespace Duplicati.Library.Main.Operation
             var fileprocessors = Enumerable.Range(0, m_options.RestoreFileProcessors).Select(i => Restore.FileProcessor.RunAsync(channels, database, fileprocessor_requests[i], fileprocessor_responses[i], restoreDestination, m_options, m_result, m_options.LoadedModules)).ToArray();
             var blockmanager = Restore.BlockManager.RunAsync(channels, database, fileprocessor_requests, fileprocessor_responses, m_options, m_result);
             var volumecache = Restore.VolumeManager.RunAsync(channels, m_options, m_result);
-            var volumedownloaders = Enumerable.Range(0, m_options.RestoreVolumeDownloaders).Select(i => Restore.VolumeDownloader.RunAsync(channels, database, backendManager, m_options, m_result)).ToArray();
+            var volumedownloaders = Enumerable.Range(0, volumeDownloaderCount).Select(i => Restore.VolumeDownloader.RunAsync(channels, database, backendManager, m_options, m_result)).ToArray();
             var volumedecryptors = Enumerable.Range(0, m_options.RestoreVolumeDecryptors).Select(i => Restore.VolumeDecryptor.RunAsync(channels, backendManager, m_options)).ToArray();
             var volumedecompressors = Enumerable.Range(0, m_options.RestoreVolumeDecompressors).Select(i => Restore.VolumeDecompressor.RunAsync(channels, m_options)).ToArray();
 
@@ -1088,8 +1114,9 @@ namespace Duplicati.Library.Main.Operation
         /// <param name="database">The database containing information about the restore.</param>
         /// <param name="filter">The filter of which files to restore.</param>
         /// <param name="restoreDestination">The destination to restore to.</param>
+        /// <param name="verifyRemoteList">True to verify the remote list against the database before restoring.</param>
         /// <param name="cancellationToken">The cancellation token to monitor for cancellation requests.</param>
-        private async Task DoRunAsync(IBackendManager backendManager, LocalRestoreDatabase database, Library.Utility.IFilter? filter, IRestoreDestinationProvider restoreDestination, long restoreVersion, DateTime restoreBackupTimestamp, CancellationToken cancellationToken)
+        private async Task DoRunAsync(IBackendManager backendManager, LocalRestoreDatabase database, Library.Utility.IFilter? filter, IRestoreDestinationProvider restoreDestination, long restoreVersion, DateTime restoreBackupTimestamp, bool verifyRemoteList, CancellationToken cancellationToken)
         {
             using (var metadatastorage = new RestoreHandlerMetadataStorage())
             {
@@ -1100,7 +1127,7 @@ namespace Duplicati.Library.Main.Operation
                     .ConfigureAwait(false);
                 m_blockbuffer = new byte[m_options.Blocksize];
 
-                if (!m_options.NoBackendverification)
+                if (verifyRemoteList)
                 {
                     m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Restore_PreRestoreVerify);
                     await FilelistProcessor.VerifyRemoteListAsync(backendManager, m_options, database, m_result.BackendWriter, latestVolumesOnly: false, verifyMode: FilelistProcessor.VerifyMode.VerifyOnly, cancellationToken).ConfigureAwait(false);

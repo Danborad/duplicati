@@ -111,6 +111,97 @@ public class ServerApiIntegrationTests : BasicSetupHelper
         }
     }
 
+    /// <summary>
+    /// A link in a folder listing keeps its own path, and its target is reported in symlinkTarget
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task AListedLinkReportsItsTargetSeparately_Async()
+    {
+        var folder = Path.Combine(this.DATAFOLDER, "links");
+        var target = Path.Combine(folder, "target");
+        var link = Path.Combine(folder, "link");
+        Directory.CreateDirectory(Path.Combine(target, "sub"));
+        MakeFolderLink(link, target);
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var nodes = await ListFolderAsync(httpClient, Util.AppendDirSeparator(folder)).ConfigureAwait(false);
+            var node = nodes.Single(x => x.GetProperty("text").GetString() == "link");
+
+            Assert.That(node.GetProperty("symlink").GetBoolean(), Is.True);
+            Assert.That(node.GetProperty("id").GetString(), Is.EqualTo(Util.AppendDirSeparator(link)));
+            Assert.That(node.TryGetProperty("symlinkTarget", out var symlinkTarget) ? symlinkTarget.GetString() : null,
+                Is.Not.Null.And.EqualTo(target).Or.EqualTo(Util.AppendDirSeparator(target)));
+            Assert.That(node.GetProperty("resolvedpath").ValueKind, Is.EqualTo(JsonValueKind.Null),
+                "The path of the link must not be replaced by its target");
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Below a special folder, resolvedpath is the path of each entry, also for a link, and the
+    /// link target is reported in symlinkTarget. The home folder is only read, not changed.
+    /// A Windows profile has compatibility junctions such as Application Data
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task ALinkBelowTheHomeFolderKeepsItsOwnResolvedPath_Async()
+    {
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrEmpty(home) || !Directory.EnumerateFileSystemEntries(home).Any(x => new FileInfo(x).LinkTarget != null))
+            Assert.Ignore("The home folder holds no link");
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var nodes = await ListFolderAsync(httpClient, "%HOME%" + Path.DirectorySeparatorChar).ConfigureAwait(false);
+            var links = nodes.Where(x => x.GetProperty("symlink").GetBoolean()).ToList();
+            Assert.That(links, Is.Not.Empty);
+
+            foreach (var node in links)
+            {
+                var name = node.GetProperty("text").GetString()!;
+                var resolved = node.GetProperty("resolvedpath").GetString();
+                Assert.That(resolved?.TrimEnd(Path.DirectorySeparatorChar), Is.EqualTo(Path.Combine(home, name)),
+                    $"The resolved path of {name} must be its own path");
+                Assert.That(node.TryGetProperty("symlinkTarget", out var symlinkTarget) ? symlinkTarget.GetString() : null,
+                    Is.Not.Null.And.Not.Empty, $"The target of {name} must be reported");
+            }
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Lists a folder with the filesystem endpoint, including the hidden entries
+    /// </summary>
+    /// <param name="httpClient">The authenticated client</param>
+    /// <param name="path">The folder to list</param>
+    /// <returns>The listed nodes</returns>
+    private static async Task<List<JsonElement>> ListFolderAsync(HttpClient httpClient, string path)
+    {
+        var response = await httpClient.PostAsJsonAsync("/api/v1/filesystem?onlyFolders=true&showHidden=true", new { path }, JsonOptions).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), body);
+        using var document = JsonDocument.Parse(body);
+        return document.RootElement.EnumerateArray().Select(x => x.Clone()).ToList();
+    }
+
+    /// <summary>
+    /// Makes a link to a folder: a junction on Windows, which needs no privilege, and a symbolic link elsewhere
+    /// </summary>
+    /// <param name="path">The path of the link</param>
+    /// <param name="target">The folder the link points to</param>
+    private static void MakeFolderLink(string path, string target)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Directory.CreateSymbolicLink(path, target);
+            return;
+        }
+
+        using var p = Process.Start(new ProcessStartInfo("cmd.exe", $"/c mklink /J \"{path}\" \"{target}\"") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true })!;
+        p.WaitForExit();
+        Assert.That(p.ExitCode, Is.EqualTo(0), p.StandardError.ReadToEnd());
+    }
+
     [Test]
     [Category("Integration")]
     public async Task ImportSupportsProvidingPassphraseOverride_Async()
@@ -225,6 +316,13 @@ public class ServerApiIntegrationTests : BasicSetupHelper
                     Assert.Fail("System info payload did not contain a server version name");
                 Assert.That(serverVersionNameElement.GetString(), Is.Not.Null.And.Not.Empty, "Server version name should be populated");
 
+                Assert.That(GetStringProperty(systemInfo, "entryAssembly"), Is.EqualTo(Duplicati.Library.Utility.Utility.getEntryAssembly().GetName().Name), "System info should report the entry assembly");
+                Assert.That(Path.GetFullPath(GetStringProperty(systemInfo, "installationFolder")!), Is.EqualTo(Path.GetFullPath(Util.AppendDirSeparator(installationRoot))), "System info should report the entry assembly folder as the installation folder");
+
+                var dataFolder = GetStringProperty(systemInfo, "dataFolder");
+                Assert.That(dataFolder, Is.Not.Null.And.Not.Empty, "System info should report the data folder");
+                Assert.That(File.Exists(Path.Combine(dataFolder!, DataFolderManager.SERVER_DATABASE_FILENAME)), Is.True, "The reported data folder should hold the server database");
+
                 var hasOptionsProperty = systemInfo.TryGetProperty("options", out var optionsElement) || systemInfo.TryGetProperty("Options", out optionsElement);
                 Assert.That(hasOptionsProperty && optionsElement.ValueKind == JsonValueKind.Array, Is.True, "System information should include option metadata");
 
@@ -298,6 +396,84 @@ public class ServerApiIntegrationTests : BasicSetupHelper
         }
     }
 
+    /// <summary>
+    /// A folder that may not be listed, such as the compatibility junctions of a Windows profile
+    /// (Everyone is denied List folder on Cookies and Application Data), is reported as forbidden,
+    /// and a folder next to it is still listed
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task ListingAFolderThatMayNotBeListedIsForbidden_Async()
+    {
+        var deniedFolder = Path.Combine(this.DATAFOLDER, "cannot-list");
+        var openFolder = Path.Combine(this.DATAFOLDER, "can-list");
+        Directory.CreateDirectory(Path.Combine(deniedFolder, "sub"));
+        Directory.CreateDirectory(Path.Combine(openFolder, "sub"));
+
+        DenyListing(deniedFolder, true);
+        try
+        {
+            try
+            {
+                Directory.GetFileSystemEntries(deniedFolder);
+                Assert.Ignore("The folder can still be listed, so the test cannot deny it (running as root?)");
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+
+            await WithAuthenticatedServerAsync(async httpClient =>
+            {
+                var denied = await httpClient.PostAsJsonAsync("/api/v1/filesystem?onlyFolders=true&showHidden=true", new { path = Util.AppendDirSeparator(deniedFolder) }, JsonOptions).ConfigureAwait(false);
+                var deniedBody = await denied.Content.ReadAsStringAsync().ConfigureAwait(false);
+                Assert.That(denied.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden), deniedBody);
+                using (var error = JsonDocument.Parse(deniedBody))
+                {
+                    Assert.That(error.RootElement.GetProperty("Code").GetInt32(), Is.EqualTo(403));
+                    Assert.That(error.RootElement.GetProperty("Error").GetString(), Does.Contain(deniedFolder));
+                }
+
+                var open = await httpClient.PostAsJsonAsync("/api/v1/filesystem?onlyFolders=true&showHidden=true", new { path = Util.AppendDirSeparator(openFolder) }, JsonOptions).ConfigureAwait(false);
+                var openBody = await open.Content.ReadAsStringAsync().ConfigureAwait(false);
+                Assert.That(open.StatusCode, Is.EqualTo(HttpStatusCode.OK), openBody);
+                Assert.That(openBody, Does.Contain("\"text\":\"sub\""));
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            DenyListing(deniedFolder, false);
+        }
+    }
+
+    /// <summary>
+    /// Denies or allows listing a folder that the test created, for the account that runs the test
+    /// </summary>
+    /// <param name="folder">The folder</param>
+    /// <param name="deny"><c>true</c> to deny listing the folder, <c>false</c> to allow it again</param>
+    private static void DenyListing(string folder, bool deny)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var directory = new DirectoryInfo(folder);
+            var security = directory.GetAccessControl();
+            var rule = new System.Security.AccessControl.FileSystemAccessRule(
+                System.Security.Principal.WindowsIdentity.GetCurrent().User!,
+                System.Security.AccessControl.FileSystemRights.ListDirectory,
+                System.Security.AccessControl.AccessControlType.Deny);
+            if (deny)
+                security.AddAccessRule(rule);
+            else
+                security.RemoveAccessRule(rule);
+            directory.SetAccessControl(security);
+        }
+        else
+        {
+            File.SetUnixFileMode(folder, deny
+                ? UnixFileMode.None
+                : UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
     [Test]
     [Category("Integration")]
     public async Task ServerBackupListMasksTargetUrl_Async()
@@ -339,6 +515,86 @@ public class ServerApiIntegrationTests : BasicSetupHelper
                          ?? throw new InvalidOperationException("Backup get response was empty");
             Assert.That(single.Backup.TargetURL, Is.EqualTo(listedBackup.TargetURL), "List and single-backup GET should mask the target URL the same way");
         }).ConfigureAwait(false);
+    }
+
+    [Test]
+    [Category("Integration")]
+    public async Task BackupCanBeDisabledAndEnabledThroughTheApi_Async()
+    {
+        const string passphrase = "integration-passphrase";
+        var name = $"Enabled flag backup {Guid.NewGuid():N}";
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            async Task<bool> IsEnabledAsync(string id)
+            {
+                var listed = await AssertBackupListedAsync(httpClient, id).ConfigureAwait(false);
+                var getResponse = await httpClient.GetAsync($"/api/v1/backup/{id}").ConfigureAwait(false);
+                getResponse.EnsureSuccessStatusCode();
+                var single = await getResponse.Content.ReadFromJsonAsync<BackupGet.GetBackupResultDto>(JsonOptions).ConfigureAwait(false)
+                             ?? throw new InvalidOperationException("Backup get response was empty");
+                Assert.That(single.Backup.Enabled, Is.EqualTo(listed.Enabled), "List and single-backup GET should agree on the enabled flag");
+                return listed.Enabled;
+            }
+
+            Assert.That(await GetApiExtensionsAsync(httpClient).ConfigureAwait(false), Does.Contain(SystemInfoProvider.BackupEnableDisableExtension),
+                "System info should advertise that backups can be enabled and disabled");
+
+            var backupId = await CreateBackupAsync(httpClient, passphrase, name).ConfigureAwait(false);
+            Assert.That(await IsEnabledAsync(backupId).ConfigureAwait(false), Is.True, "A new backup should be enabled");
+
+            (await httpClient.PostAsync($"/api/v1/backup/{backupId}/disable", null).ConfigureAwait(false)).EnsureSuccessStatusCode();
+            Assert.That(await IsEnabledAsync(backupId).ConfigureAwait(false), Is.False, "Disabling should be reflected by the API");
+
+            // A client that does not know about the flag must not re-enable the backup when it saves it
+            var update = new BackupAndScheduleInputDto
+            {
+                Backup = new BackupAndScheduleInputDto.BackupInputDto
+                {
+                    Name = name,
+                    Description = "Updated without the enabled flag",
+                    TargetURL = BuildFileBackendUrl(this.TARGETFOLDER),
+                    Sources = new[] { this.DATAFOLDER },
+                    Settings = new[] { new BackupAndScheduleInputDto.SettingInputDto { Name = "passphrase", Value = passphrase } },
+                    Filters = Array.Empty<BackupAndScheduleInputDto.FilterInputDto>(),
+                    Metadata = new Dictionary<string, string>()
+                }
+            };
+            (await httpClient.PutAsJsonAsync($"/api/v1/backup/{backupId}", update, JsonOptions).ConfigureAwait(false)).EnsureSuccessStatusCode();
+            Assert.That(await IsEnabledAsync(backupId).ConfigureAwait(false), Is.False, "Saving without the flag should keep the backup disabled");
+
+            // An exported disabled backup is imported as disabled
+            var exportBytes = await ExportConfigurationAsync(httpClient, backupId).ConfigureAwait(false);
+            var importedId = await ImportConfigurationAsync(httpClient, exportBytes).ConfigureAwait(false);
+            Assert.That(await IsEnabledAsync(importedId).ConfigureAwait(false), Is.False, "Import should keep the disabled flag");
+
+            (await httpClient.PostAsync($"/api/v1/backup/{backupId}/enable", null).ConfigureAwait(false)).EnsureSuccessStatusCode();
+            Assert.That(await IsEnabledAsync(backupId).ConfigureAwait(false), Is.True, "Enabling should be reflected by the API");
+
+            var missing = await httpClient.PostAsync("/api/v1/backup/999999/disable", null).ConfigureAwait(false);
+            Assert.That(missing.StatusCode, Is.EqualTo(HttpStatusCode.NotFound), "Disabling an unknown backup should return 404");
+        }).ConfigureAwait(false);
+    }
+
+    [Test]
+    [Category("Integration")]
+    public async Task BackupEnableDisableExtensionCanBeHidden_Async()
+    {
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var extensions = await GetApiExtensionsAsync(httpClient).ConfigureAwait(false);
+            Assert.That(extensions, Does.Not.Contain(SystemInfoProvider.BackupEnableDisableExtension),
+                "A disabled API extension should not be reported by system info");
+            Assert.That(extensions, Is.Not.Empty, "Hiding one extension should keep the others");
+        }, null, "127.0.0.1", [$"--webservice-disable-api-extensions={SystemInfoProvider.BackupEnableDisableExtension}"]).ConfigureAwait(false);
+    }
+
+    private static async Task<string[]> GetApiExtensionsAsync(HttpClient httpClient)
+    {
+        var systemInfo = await httpClient.GetFromJsonAsync<JsonElement>("/api/v1/systeminfo", JsonOptions).ConfigureAwait(false);
+        var found = systemInfo.TryGetProperty("apiExtensions", out var extensions) || systemInfo.TryGetProperty("APIExtensions", out extensions);
+        Assert.That(found, Is.True, "System information should include the API extensions");
+        return extensions.EnumerateArray().Select(x => x.GetString() ?? "").ToArray();
     }
 
     // The trailing semicolon is the value from issue #7425; the second value has an interval
@@ -771,6 +1027,198 @@ public class ServerApiIntegrationTests : BasicSetupHelper
     }
 
     /// <summary>
+    /// The new UI lists several folders of a backup at the same time, for example when folders are
+    /// opened quickly in the restore tree. Such listings must wait for each other instead of failing
+    /// with DatabaseLocked, which only a running operation such as a backup should cause.
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task ListingsOfOneBackupAtTheSameTimeDoNotFail_Async()
+    {
+        foreach (var folder in new[] { "a", "b", "c" })
+        {
+            Directory.CreateDirectory(Path.Combine(this.DATAFOLDER, folder));
+            File.WriteAllText(Path.Combine(this.DATAFOLDER, folder, "file.txt"), folder);
+        }
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var backupId = await CreateBackupAsync(httpClient, "integration-passphrase").ConfigureAwait(false);
+            await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
+
+            var source = Library.Common.IO.Util.AppendDirSeparator(this.DATAFOLDER);
+            var listings = Enumerable.Range(0, 12)
+                .Select(i => httpClient.PostAsJsonAsync("/api/v2/backup/list-folder", new { BackupId = backupId, Paths = new[] { source + new[] { "a", "b", "c" }[i % 3] + Path.DirectorySeparatorChar }, PageSize = 1000, Page = 0, Time = (string?)null }))
+                .ToList();
+            var bodies = new List<string>();
+            foreach (var response in await Task.WhenAll(listings).ConfigureAwait(false))
+                bodies.Add(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+
+            Assert.That(bodies, Has.None.Contains("DatabaseLocked"), string.Join(Environment.NewLine, bodies.Where(b => b.Contains("DatabaseLocked"))));
+            Assert.That(bodies, Has.All.Contains("file.txt"));
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// While a queued operation such as a backup holds the database, a listing still fails at once
+    /// with DatabaseLocked instead of waiting for it.
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task AListingFailsAtOnceWhileAnOperationHoldsTheDatabase_Async()
+    {
+        File.WriteAllText(Path.Combine(this.DATAFOLDER, "file.txt"), "content");
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var backupId = await CreateBackupAsync(httpClient, "integration-passphrase").ConfigureAwait(false);
+            await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
+
+            var provider = ServerProgram.DuplicatiWebserver.Provider;
+            var connection = (Duplicati.Server.Database.Connection)provider.GetService(typeof(Duplicati.Server.Database.Connection))!;
+            var tracker = (Duplicati.WebserverCore.Abstractions.IDatabaseLockTracker)provider.GetService(typeof(Duplicati.WebserverCore.Abstractions.IDatabaseLockTracker))!;
+            var held = tracker.TryAcquire(Duplicati.Server.Runner.GetEffectiveDBPath(connection.GetBackup(backupId)!));
+            Assert.That(held, Is.Not.Null);
+            try
+            {
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                var response = await httpClient.PostAsJsonAsync("/api/v2/backup/list-folder", new { BackupId = backupId, Paths = new[] { Library.Common.IO.Util.AppendDirSeparator(this.DATAFOLDER) }, PageSize = 1000, Page = 0, Time = (string?)null }).ConfigureAwait(false);
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                Assert.That(body, Does.Contain("DatabaseLocked"));
+                Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromSeconds(10)), "The listing should not wait for the operation");
+            }
+            finally
+            {
+                await held!.DisposeAsync().ConfigureAwait(false);
+            }
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The old UI lists the files of one version to choose what to restore. The all-versions option
+    /// of the backup or the server must not turn that into a list of every version, or it shows
+    /// files that the restore of the version then leaves out (#5055).
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task FileListOfOneVersionIgnoresTheAllVersionsSetting_Async()
+    {
+        var backupPassphrase = "integration-passphrase";
+        File.WriteAllText(Path.Combine(this.DATAFOLDER, "kept.txt"), "kept");
+        File.WriteAllText(Path.Combine(this.DATAFOLDER, "deleted.txt"), "deleted");
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var backupId = await CreateBackupAsync(httpClient, backupPassphrase,
+                extraSettings: [new BackupAndScheduleInputDto.SettingInputDto { Name = "all-versions", Value = "true" }]).ConfigureAwait(false);
+
+            await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
+            File.Delete(Path.Combine(this.DATAFOLDER, "deleted.txt"));
+            await Task.Delay(TimeSpan.FromSeconds(1.5)).ConfigureAwait(false);
+            await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
+
+            var listFilesetsResponse = await httpClient.PostAsJsonAsync("/api/v2/backup/list-filesets", new ListFilesetsRequestDto { BackupId = backupId }, JsonOptions).ConfigureAwait(false);
+            listFilesetsResponse.EnsureSuccessStatusCode();
+            var listFilesets = await listFilesetsResponse.Content.ReadFromJsonAsync<ListFilesetsResponseDto>(JsonOptions).ConfigureAwait(false)
+                               ?? throw new InvalidOperationException("list-filesets response was empty");
+            Assert.That(listFilesets.Data, Has.Count.EqualTo(2));
+            var latest = listFilesets.Data!.OrderByDescending(fileset => fileset.Time).First().Time.ToUniversalTime().ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+            var folderFilter = Uri.EscapeDataString("@" + Util.AppendDirSeparator(this.DATAFOLDER));
+
+            async Task<string[]> ListFileNamesAsync(string query)
+            {
+                var response = await httpClient.GetAsync($"/api/v1/backup/{backupId}/files?prefix-only=false&folder-contents=true&filter={folderFilter}&{query}").ConfigureAwait(false);
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), body);
+                var files = JsonDocument.Parse(body).RootElement.EnumerateObject()
+                    .Single(p => string.Equals(p.Name, "Files", StringComparison.OrdinalIgnoreCase)).Value;
+                return files.EnumerateArray()
+                    .Select(f => f.EnumerateObject().Single(p => string.Equals(p.Name, "Path", StringComparison.OrdinalIgnoreCase)).Value.GetString()!)
+                    .Select(Path.GetFileName)
+                    .Where(n => !string.IsNullOrEmpty(n))
+                    .Select(n => n!)
+                    .ToArray();
+            }
+
+            // The latest version, which is what the restore of that version gives back
+            Assert.That(await ListFileNamesAsync($"time={Uri.EscapeDataString(latest)}").ConfigureAwait(false), Is.EquivalentTo(new[] { "kept.txt" }));
+
+            // Asking for every version still lists the deleted file
+            Assert.That(await ListFileNamesAsync("all-versions=true").ConfigureAwait(false), Does.Contain("deleted.txt"));
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A scheduled run that is due while the server is paused, as it is for a while after a start,
+    /// waits in the queue. If the schedule is removed in the meantime, the run is no longer wanted
+    /// and must not start when the server resumes (#5045). A run whose schedule is kept still starts.
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task QueuedScheduledRunStartsOnlyWhileItIsScheduled_Async(bool removeSchedule)
+    {
+        File.WriteAllText(Path.Combine(this.DATAFOLDER, "sample.txt"), "Sample content");
+        Directory.CreateDirectory(this.TARGETFOLDER);
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var queueRunner = (IQueueRunnerService)ServerProgram.DuplicatiWebserver.Provider.GetService(typeof(IQueueRunnerService))!;
+            (await httpClient.PostAsync("/api/v1/serverstate/pause", null).ConfigureAwait(false)).EnsureSuccessStatusCode();
+
+            var backup = new BackupAndScheduleInputDto.BackupInputDto
+            {
+                Name = $"Scheduled backup {Guid.NewGuid():N}",
+                Description = "Integration test backup",
+                TargetURL = BuildFileBackendUrl(this.TARGETFOLDER),
+                Sources = new[] { this.DATAFOLDER },
+                Settings = new[] { new BackupAndScheduleInputDto.SettingInputDto { Name = "passphrase", Value = "integration-passphrase" } },
+                Filters = Array.Empty<BackupAndScheduleInputDto.FilterInputDto>(),
+                Metadata = new Dictionary<string, string>()
+            };
+            var createResponse = await httpClient.PostAsJsonAsync("/api/v1/backups", new BackupAndScheduleInputDto
+            {
+                Backup = backup,
+                Schedule = new BackupAndScheduleInputDto.ScheduleInputDto { Time = DateTime.UtcNow.AddHours(-1), Repeat = "1D" }
+            }, JsonOptions).ConfigureAwait(false);
+            createResponse.EnsureSuccessStatusCode();
+            var backupId = (await createResponse.Content.ReadFromJsonAsync<CreateBackupDto>(JsonOptions).ConfigureAwait(false))!.ID;
+
+            // The run is overdue, so the scheduler queues it while the server is paused
+            var stopwatch = Stopwatch.StartNew();
+            while (!queueRunner.GetCurrentTasks().Any(t => t.BackupID == backupId))
+            {
+                if (stopwatch.Elapsed > TimeSpan.FromSeconds(30))
+                    Assert.Fail("The scheduler did not queue the overdue run");
+                await Task.Delay(100).ConfigureAwait(false);
+            }
+
+            if (removeSchedule)
+            {
+                var updateResponse = await httpClient.PutAsJsonAsync($"/api/v1/backup/{backupId}", new BackupAndScheduleInputDto { Backup = backup }, JsonOptions).ConfigureAwait(false);
+                updateResponse.EnsureSuccessStatusCode();
+            }
+
+            (await httpClient.PostAsync("/api/v1/serverstate/resume", null).ConfigureAwait(false)).EnsureSuccessStatusCode();
+
+            stopwatch.Restart();
+            while (queueRunner.GetCurrentTasks().Count > 0 || queueRunner.GetCurrentTask() != null)
+            {
+                if (stopwatch.Elapsed > TimeSpan.FromMinutes(1))
+                    Assert.Fail("The queue did not empty");
+                await Task.Delay(100).ConfigureAwait(false);
+            }
+
+            if (removeSchedule)
+                Assert.That(Directory.GetFiles(this.TARGETFOLDER), Is.Empty, "The run of the removed schedule backed up");
+            else
+                Assert.That(Directory.GetFiles(this.TARGETFOLDER, "*.dlist.*"), Has.Length.EqualTo(1), "The scheduled run did not back up");
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Waits until the task is no longer current, so its result has been stored.
     /// </summary>
     private static async Task WaitForTaskResultAsync(long taskId)
@@ -925,6 +1373,41 @@ public class ServerApiIntegrationTests : BasicSetupHelper
 
     [Test]
     [Category("Integration")]
+    public async Task DestinationTestIgnoresTestFileOfAnotherTestV2_Async()
+    {
+        // The folder only holds the test file of another test of the same destination
+        // that is still running, so it should still be reported as empty
+        var folder = Path.Combine(BASEFOLDER, "destination-with-test-file");
+        if (Directory.Exists(folder))
+            Directory.Delete(folder, true);
+        Directory.CreateDirectory(folder);
+        var otherTestFile = Path.Combine(folder,
+            Library.Utility.BackendExtensions.TEST_FILE_PREFIX + "othertest" + Library.Utility.BackendExtensions.TEST_FILE_EXTENSION);
+        File.WriteAllText(otherTestFile, Library.Utility.BackendExtensions.TEST_FILE_CONTENT);
+
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var request = new DestinationTestRequestDto
+            {
+                DestinationUrl = "file://" + folder,
+                Options = new Dictionary<string, string>(),
+                AutoCreate = false
+            };
+
+            var response = await httpClient.PostAsJsonAsync("/api/v2/destination/test", request, JsonOptions).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            var result = await response.Content.ReadFromJsonAsync<DestinationTestResponseDto>(JsonOptions).ConfigureAwait(false)
+                         ?? throw new InvalidOperationException("destination/test response was empty");
+
+            Assert.That(result.Success, Is.True, $"The test should succeed; got {result.StatusCode}: {result.Error}");
+            Assert.That(result.Data, Is.Not.Null, "The folder state should be reported");
+            Assert.That(result.Data!.FolderIsEmpty, Is.True, "A test file of another test should not count as a file in the folder");
+            Assert.That(File.Exists(otherTestFile), Is.True, "The test file of the other test should be left alone");
+        }).ConfigureAwait(false);
+    }
+
+    [Test]
+    [Category("Integration")]
     public async Task DestinationTestDoesNotCreateWhenReadOnly_Async()
     {
         FolderExistsBackend.Reset();
@@ -1020,20 +1503,27 @@ public class ServerApiIntegrationTests : BasicSetupHelper
     }
 
     /// <summary>
-    /// A sync job copies the files to the destination without keeping versions, and its
-    /// local database is not a backup database (forum topic 22782). Listing its versions
-    /// or restoring from it is refused with a message saying so, instead of running backup
-    /// queries against the sync database, and the sync job still runs afterwards.
+    /// A sync job with snapshot folders lists one version per run, browses a version under
+    /// the original source path and restores an older version through the same endpoints
+    /// the restore of a backup uses. Operations that need a backup database are still
+    /// refused (forum topic 22782), and the sync database still works afterwards.
     /// </summary>
     [Test]
     [Category("Integration")]
-    public async Task SyncJobRefusesVersionListingAndRestore_Async()
+    public async Task SyncJobListsAndRestoresSnapshots_Async()
     {
-        File.WriteAllText(Path.Combine(this.DATAFOLDER, "sample.txt"), "Sync sample");
+        var samplePath = Path.Combine(this.DATAFOLDER, "sample.txt");
+        File.WriteAllText(samplePath, "First version");
         Directory.CreateDirectory(this.TARGETFOLDER);
 
         await WithAuthenticatedServerAsync(async httpClient =>
         {
+            var extensions = await GetApiExtensionsAsync(httpClient).ConfigureAwait(false);
+            Assert.That(extensions, Does.Contain(SystemInfoProvider.SyncSnapshotsExtension),
+                "System info should advertise snapshot folders for Sync jobs");
+            Assert.That(extensions, Does.Contain(SystemInfoProvider.SyncRestoreExtension),
+                "System info should advertise that Sync jobs can be restored");
+
             var request = new BackupAndScheduleInputDto
             {
                 Backup = new BackupAndScheduleInputDto.BackupInputDto
@@ -1046,7 +1536,8 @@ public class ServerApiIntegrationTests : BasicSetupHelper
                     Settings = new[]
                     {
                         new BackupAndScheduleInputDto.SettingInputDto { Name = "--no-encryption", Value = "true" },
-                        new BackupAndScheduleInputDto.SettingInputDto { Name = "snapshot-policy", Value = "Off" }
+                        new BackupAndScheduleInputDto.SettingInputDto { Name = "snapshot-policy", Value = "Off" },
+                        new BackupAndScheduleInputDto.SettingInputDto { Name = "--" + Duplicati.Library.Main.Options.SYNC_SNAPSHOT_FOLDERS_OPTION, Value = "true" }
                     },
                     Filters = Array.Empty<BackupAndScheduleInputDto.FilterInputDto>(),
                     Metadata = new Dictionary<string, string>()
@@ -1059,27 +1550,59 @@ public class ServerApiIntegrationTests : BasicSetupHelper
                 ?? throw new InvalidOperationException("Sync job creation did not return an ID");
 
             await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
+            File.WriteAllText(samplePath, "Second version");
+            await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
 
-            // The restore page starts by listing the versions
+            // The restore page starts by listing the versions: one per snapshot, newest first
             var listFilesetsResponse = await httpClient.PostAsJsonAsync("/api/v2/backup/list-filesets", new ListFilesetsRequestDto { BackupId = backupId }, JsonOptions).ConfigureAwait(false);
             var listFilesetsBody = await listFilesetsResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
             Assert.That(listFilesetsResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK), listFilesetsBody);
+            string olderTime;
             using (var listFilesets = JsonDocument.Parse(listFilesetsBody))
             {
-                Assert.That(listFilesets.RootElement.TryGetProperty("Success", out var success) && !success.GetBoolean(), Is.True, listFilesetsBody);
-                Assert.That(GetStringProperty(listFilesets.RootElement, "statusCode"), Is.EqualTo("SyncJobNotSupported"), listFilesetsBody);
+                Assert.That(listFilesets.RootElement.GetProperty("Success").GetBoolean(), Is.True, listFilesetsBody);
+                var versions = listFilesets.RootElement.GetProperty("Data").EnumerateArray().ToArray();
+                Assert.That(versions, Has.Length.EqualTo(2), listFilesetsBody);
+                Assert.That(versions[0].GetProperty("Version").GetInt64(), Is.EqualTo(0), listFilesetsBody);
+                olderTime = versions[1].GetProperty("Time").GetDateTime().ToUniversalTime().ToString("o");
             }
 
+            // The file tree starts at the source folder, as it does for a backup
+            var sourceFolder = Duplicati.Library.Common.IO.Util.AppendDirSeparator(this.DATAFOLDER);
+            var rootResponse = await httpClient.PostAsJsonAsync("/api/v2/backup/list-folder", new ListFolderContentRequestDto { BackupId = backupId, Paths = null, Time = olderTime, PageSize = 1000, Page = 0 }, JsonOptions).ConfigureAwait(false);
+            var rootBody = await rootResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
+            Assert.That(rootResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK), rootBody);
+            using (var root = JsonDocument.Parse(rootBody))
+                Assert.That(root.RootElement.GetProperty("Data").EnumerateArray().Select(x => x.GetProperty("Path").GetString()), Is.EqualTo(new[] { sourceFolder }), rootBody);
+
+            var folderResponse = await httpClient.PostAsJsonAsync("/api/v2/backup/list-folder", new ListFolderContentRequestDto { BackupId = backupId, Paths = new[] { sourceFolder }, Time = olderTime, PageSize = 1000, Page = 0 }, JsonOptions).ConfigureAwait(false);
+            var folderBody = await folderResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using (var folder = JsonDocument.Parse(folderBody))
+                Assert.That(folder.RootElement.GetProperty("Data").EnumerateArray().Select(x => x.GetProperty("Path").GetString()), Does.Contain(samplePath), folderBody);
+
+            // Restore the older version of the folder, the way the restore page asks for it
+            if (Directory.Exists(this.RESTOREFOLDER))
+                Directory.Delete(this.RESTOREFOLDER, true);
             var restoreResponse = await httpClient.PostAsJsonAsync(
                 $"/api/v1/backup/{backupId}/restore",
-                new RestoreInputDto(null, null, "now", this.RESTOREFOLDER, true, false, false, null, null),
+                new RestoreInputDto(new[] { sourceFolder + "*" }, null, olderTime, this.RESTOREFOLDER, true, false, false, null, null),
                 JsonOptions).ConfigureAwait(false);
             var restoreBody = await restoreResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
-            Assert.That(restoreResponse.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), restoreBody);
-            using (var restore = JsonDocument.Parse(restoreBody))
-                Assert.That(GetStringProperty(restore.RootElement, "helpId"), Is.EqualTo("SyncJobNotSupported"), restoreBody);
+            Assert.That(restoreResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK), restoreBody);
+            var restoreTask = await restoreResponse.Content.ReadFromJsonAsync<TaskStartedDto>(JsonOptions).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("Restore did not return a task");
+            await WaitForTaskCompletionAsync(httpClient, restoreTask.ID).ConfigureAwait(false);
+            await AssertTaskCompletedAsync(httpClient, restoreTask.ID).ConfigureAwait(false);
+            Assert.That(File.ReadAllText(Path.Combine(this.RESTOREFOLDER, "sample.txt")), Is.EqualTo("First version"));
 
-            // The refused requests did not damage the sync database
+            // Operations that need a backup database are still refused
+            var verifyResponse = await httpClient.PostAsync($"/api/v1/backup/{backupId}/verify", null).ConfigureAwait(false);
+            var verifyBody = await verifyResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
+            Assert.That(verifyResponse.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), verifyBody);
+            using (var verify = JsonDocument.Parse(verifyBody))
+                Assert.That(GetStringProperty(verify.RootElement, "helpId"), Is.EqualTo("SyncJobNotSupported"), verifyBody);
+
+            // Listing and restoring did not damage the sync database
             await RunTaskAndWaitAsync(httpClient, $"/api/v1/backup/{backupId}/run").ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
@@ -1214,6 +1737,91 @@ public class ServerApiIntegrationTests : BasicSetupHelper
     }
 
     /// <summary>
+    /// Changing the password resets the JWT signing key and drops all token families,
+    /// so tokens issued before the change stop working right away, without a restart.
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task ChangingThePasswordInvalidatesExistingTokens_Async()
+    {
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            using var client = new HttpClient(new HttpClientHandler { UseCookies = false }) { BaseAddress = httpClient.BaseAddress };
+            var connection = (Duplicati.Server.Database.Connection?)ServerProgram.DuplicatiWebserver.Provider.GetService(typeof(Duplicati.Server.Database.Connection))
+                ?? throw new InvalidOperationException("The server has no database connection");
+
+            var login = await client.PostAsJsonAsync("/api/v1/auth/login", new { password = "integration-test-password", rememberMe = true }, JsonOptions).ConfigureAwait(false);
+            login.EnsureSuccessStatusCode();
+            var cookie = login.Headers.GetValues("Set-Cookie").Single(c => c.StartsWith("RefreshToken_", StringComparison.Ordinal) && !c.Contains("expires=Thu, 01 Jan 1970", StringComparison.OrdinalIgnoreCase)).Split(';')[0];
+            var tokens = await login.Content.ReadFromJsonAsync<AccessTokenOutputDto>(JsonOptions).ConfigureAwait(false);
+            var oldJwtConfig = connection.ApplicationSettings.JWTConfig;
+
+            using var oldSocket = await ConnectAuthenticatedWebsocketAsync(httpClient.BaseAddress!, tokens!.AccessToken!).ConfigureAwait(false);
+
+            var change = await httpClient.PatchAsJsonAsync("/api/v1/serversettings", new Dictionary<string, string> { ["server-passphrase"] = "new-integration-test-password" }).ConfigureAwait(false);
+            change.EnsureSuccessStatusCode();
+
+            Assert.That(connection.ApplicationSettings.JWTConfig, Is.Not.Null.And.Not.EqualTo(oldJwtConfig), "The JWT config should be replaced");
+            Assert.That(await ReadUntilClosedAsync(oldSocket).ConfigureAwait(false), Is.EqualTo((System.Net.WebSockets.WebSocketCloseStatus)4401), "A websocket authenticated before the change should be closed");
+
+            using var oldAccess = new HttpRequestMessage(HttpMethod.Get, "/api/v1/serverstate");
+            oldAccess.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokens!.AccessToken);
+            Assert.That((await client.SendAsync(oldAccess).ConfigureAwait(false)).StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), "An access token from before the change should be rejected");
+
+            var callerAccess = await httpClient.GetAsync("/api/v1/serverstate").ConfigureAwait(false);
+            Assert.That(callerAccess.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), "The token used to change the password should be rejected too");
+
+            using var refresh = new HttpRequestMessage(HttpMethod.Post, "/api/v1/auth/refresh") { Content = JsonContent.Create(new { nonce = tokens.RefreshNonce }) };
+            refresh.Headers.Add("Cookie", cookie);
+            Assert.That((await client.SendAsync(refresh).ConfigureAwait(false)).StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), "A refresh token from before the change should be rejected");
+
+            var oldPassword = await client.PostAsJsonAsync("/api/v1/auth/login", new { password = "integration-test-password", rememberMe = true }, JsonOptions).ConfigureAwait(false);
+            Assert.That(oldPassword.IsSuccessStatusCode, Is.False, "The old password should no longer log in");
+
+            await AuthenticateAsync(httpClient, "new-integration-test-password").ConfigureAwait(false);
+            var afterLogin = await httpClient.GetAsync("/api/v1/serverstate").ConfigureAwait(false);
+            Assert.That(afterLogin.StatusCode, Is.EqualTo(HttpStatusCode.OK), "A login with the new password should work");
+
+            // The websocket authenticator is long-lived, so it must also validate with the new key
+            using var newSocket = await ConnectAuthenticatedWebsocketAsync(httpClient.BaseAddress!, httpClient.DefaultRequestHeaders.Authorization!.Parameter!).ConfigureAwait(false);
+            await newSocket.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, null, CancellationToken.None).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Opens a notifications websocket and authenticates it with the token, failing the test if it is rejected
+    /// </summary>
+    private static async Task<System.Net.WebSockets.ClientWebSocket> ConnectAuthenticatedWebsocketAsync(Uri baseAddress, string token)
+    {
+        var socket = new System.Net.WebSockets.ClientWebSocket();
+        await socket.ConnectAsync(new Uri($"ws://{baseAddress.Authority}/notifications"), CancellationToken.None).ConfigureAwait(false);
+        await socket.SendAsync(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { Version = 1, Token = token })), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+
+        var buffer = new byte[4096];
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var result = await socket.ReceiveAsync(buffer, timeout.Token).ConfigureAwait(false);
+        Assert.That(result.MessageType, Is.EqualTo(System.Net.WebSockets.WebSocketMessageType.Text), $"The websocket was closed: {result.CloseStatus} {result.CloseStatusDescription}");
+        using var reply = JsonDocument.Parse(buffer.AsMemory(0, result.Count));
+        Assert.That(reply.RootElement.GetProperty("Success").GetBoolean(), Is.True, $"The websocket rejected the token: {reply.RootElement}");
+        return socket;
+    }
+
+    /// <summary>
+    /// Reads from the websocket until the server closes it, returning the close status
+    /// </summary>
+    private static async Task<System.Net.WebSockets.WebSocketCloseStatus?> ReadUntilClosedAsync(System.Net.WebSockets.ClientWebSocket socket)
+    {
+        var buffer = new byte[16 * 1024];
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (true)
+        {
+            var result = await socket.ReceiveAsync(buffer, timeout.Token).ConfigureAwait(false);
+            if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
+                return result.CloseStatus;
+        }
+    }
+
+    /// <summary>
     /// The refresh token cookie was set for the domain the request named in its Host header.
     /// Behind a reverse proxy that does not pass the Host header on, that is the address of
     /// the server, not the name the browser uses, so the browser rejected the cookie, every
@@ -1252,6 +1860,105 @@ public class ServerApiIntegrationTests : BasicSetupHelper
             var refreshed = await client.SendAsync(refresh).ConfigureAwait(false);
             refreshed.EnsureSuccessStatusCode();
             RefreshCookie(refreshed);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The server opened, created or upgraded its database before it checked that no other
+    /// server was running. Two servers started at the same time, such as from two startup
+    /// entries, then upgraded the same database at once, and the one that failed copied its
+    /// copy of the old database back over it (forum 22694: "no such column: OperationType").
+    /// A second server must stop before it touches the database.
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task ASecondServerDoesNotTouchTheDatabaseAsync()
+    {
+        // The test holds the instance lock and starts the second server in its own process.
+        // On Linux and macOS the lock is a POSIX record lock (lockf), which belongs to the
+        // process, so a second lock from the same process does not conflict and the server
+        // would start. On Windows the lock is a file opened with FileShare.None, which
+        // conflicts within one process as well. The order checked here is the same everywhere.
+        if (!OperatingSystem.IsWindows())
+            Assert.Ignore("The instance lock does not conflict within one process outside Windows.");
+
+        var serverDataFolder = Path.Combine(BASEFOLDER, $"server-data-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(serverDataFolder);
+        var databasePath = Path.Combine(serverDataFolder, DataFolderManager.SERVER_DATABASE_FILENAME);
+
+        var previousDataFolderEnv = Environment.GetEnvironmentVariable(DataFolderManager.DATAFOLDER_ENV_NAME);
+        Environment.SetEnvironmentVariable(DataFolderManager.DATAFOLDER_ENV_NAME, serverDataFolder);
+        var portableModeEnvName = $"{AutoUpdateSettings.AppName}__{DataFolderManager.PORTABLE_MODE_OPTION.Replace('-', '_')}".ToUpperInvariant();
+        var previousPortableModeEnv = Environment.GetEnvironmentVariable(portableModeEnvName);
+        Environment.SetEnvironmentVariable(portableModeEnvName, "false");
+
+        try
+        {
+            // The server that is already running
+            using var running = new SingleInstance(serverDataFolder);
+            Assert.That(running.IsFirstInstance, Is.True);
+
+            // Any origin but the server itself, so that the second server throws instead of exiting the process
+            var applicationSettings = new ApplicationSettings { Origin = "Test" };
+            string[] serverArgs =
+            [
+                $"--{WebServerLoader.OPTION_PORT}={GetFreeTcpPort()}",
+                $"--{WebServerLoader.OPTION_INTERFACE}=127.0.0.1",
+                $"--{DataFolderManager.SERVER_DATAFOLDER_OPTION}={serverDataFolder}",
+                "--webservice-api-only=true"
+            ];
+
+            Assert.ThrowsAsync<SingleInstance.MultipleInstanceException>(
+                () => RunServerInBackgroundAsync(applicationSettings, serverArgs).WaitAsync(TimeSpan.FromSeconds(60)));
+            Assert.That(File.Exists(databasePath), Is.False, "The second server created or opened the database before it found the running one");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(DataFolderManager.DATAFOLDER_ENV_NAME, previousDataFolderEnv);
+            Environment.SetEnvironmentVariable(portableModeEnvName, previousPortableModeEnv);
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            SafeDeleteDirectory(serverDataFolder);
+        }
+    }
+
+    /// <summary>
+    /// A page loaded with a refresh cookie that is no longer valid, for example from before an
+    /// update, tried to refresh it, and every such attempt was logged as an error in the server
+    /// log (forum 22685). It is an expected answer, so it must not be an error.
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task AnInvalidRefreshCookieIsNotLoggedAsAnErrorAsync()
+    {
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            using var client = new HttpClient(new HttpClientHandler { UseCookies = false }) { BaseAddress = httpClient.BaseAddress };
+            using var refresh = new HttpRequestMessage(HttpMethod.Post, "/api/v1/auth/refresh") { Content = JsonContent.Create(new { nonce = "" }) };
+            refresh.Headers.Add("Cookie", $"RefreshToken_{httpClient.BaseAddress!.Port}=not-a-token");
+            var response = await client.SendAsync(refresh).ConfigureAwait(false);
+            Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized));
+
+            var errors = await httpClient.GetStringAsync("/api/v1/logdata/poll?level=Error&id=0&pagesize=100").ConfigureAwait(false);
+            Assert.That(errors, Does.Not.Contain("Failed to refresh token"));
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The exceptions that the endpoints throw for an expected answer, such as unauthorized or not
+    /// found, are logged by ASP.NET as unhandled. That log category is turned off, but the event
+    /// log of Windows has a filter rule of its own, which the general rule did not reach, so each
+    /// of them was written to the event log as an error (forum 22685, event 1000).
+    /// </summary>
+    [Test]
+    [Category("Integration")]
+    public async Task TheExceptionHandlerLogsNothingAsync()
+    {
+        await WithAuthenticatedServerAsync(httpClient =>
+        {
+            var loggerFactory = (Microsoft.Extensions.Logging.ILoggerFactory)ServerProgram.DuplicatiWebserver.Provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!;
+            var logger = loggerFactory.CreateLogger("Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware");
+            Assert.That(logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Error), Is.False);
+            return Task.CompletedTask;
         }).ConfigureAwait(false);
     }
 
@@ -1351,6 +2058,82 @@ public class ServerApiIntegrationTests : BasicSetupHelper
         var result = await response.Content.ReadFromJsonAsync<AccessTokenOutputDto>(JsonOptions).ConfigureAwait(false)
                      ?? throw new InvalidOperationException("Authentication response was empty");
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", result.AccessToken);
+    }
+
+    /// <summary>
+    /// The purge-files endpoint passes SuppressCompact on to the task as no-auto-compact, only when it is set,
+    /// and only for this operation. The value given for the operation overrides the setting of the backup,
+    /// and the stored settings of the backup are not changed (duplicati/ngclient#216).
+    /// </summary>
+    /// <param name="requestValue">The JSON value of SuppressCompact in the request, or an empty string to leave it out</param>
+    /// <param name="jobNoAutoCompact">The no-auto-compact setting stored on the backup, if any</param>
+    /// <param name="expectedEffective">The no-auto-compact value the purge runs with, or <c>null</c> if it is not set</param>
+    [Test]
+    [Category("Integration")]
+    [TestCase("", null, null)]
+    [TestCase("null", null, null)]
+    [TestCase("true", null, true)]
+    [TestCase("false", null, false)]
+    [TestCase("false", "true", false)]
+    [TestCase("", "true", true)]
+    public async Task PurgeFilesPassesSuppressCompactToItsTaskOnly_Async(string requestValue, string? jobNoAutoCompact, bool? expectedEffective)
+    {
+        await WithAuthenticatedServerAsync(async httpClient =>
+        {
+            var provider = ServerProgram.DuplicatiWebserver.Provider;
+            var queueRunner = (IQueueRunnerService)provider.GetService(typeof(IQueueRunnerService))!;
+            var connection = (Duplicati.Server.Database.Connection)provider.GetService(typeof(Duplicati.Server.Database.Connection))!;
+
+            var backupId = await CreateBackupAsync(httpClient, "integration-passphrase",
+                extraSettings: jobNoAutoCompact == null
+                    ? null
+                    : [new BackupAndScheduleInputDto.SettingInputDto { Name = "no-auto-compact", Value = jobNoAutoCompact }]).ConfigureAwait(false);
+
+            // Keep the task in the queue, so its options can be read before it runs
+            (await httpClient.PostAsync("/api/v1/serverstate/pause", null).ConfigureAwait(false)).EnsureSuccessStatusCode();
+
+            var path = Path.Combine(this.DATAFOLDER, "purged.txt");
+            var suppressCompact = requestValue == "" ? "" : $",\"SuppressCompact\":{requestValue}";
+            var body = $"{{\"BackupId\":{JsonSerializer.Serialize(backupId)},\"Filters\":[{JsonSerializer.Serialize(path)}],\"Versions\":[0,2]{suppressCompact}}}";
+            var response = await httpClient.PostAsync("/api/v2/backup/purge-files",
+                new StringContent(body, System.Text.Encoding.UTF8, "application/json")).ConfigureAwait(false);
+            Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+
+            var task = queueRunner.GetCurrentTasks().OfType<Runner.IRunnerData>()
+                .Single(t => t.BackupID == backupId && t.Operation == Duplicati.Server.Serialization.DuplicatiOperation.PurgeFiles);
+
+            Assert.That(task.FilterStrings, Is.EqualTo(new[] { path }));
+            Assert.That(task.ExtraOptions?["version"], Is.EqualTo("0,2"));
+
+            if (requestValue is "" or "null")
+                Assert.That(task.ExtraOptions!.ContainsKey("no-auto-compact"), Is.False, "An unset SuppressCompact must not add an option");
+            else
+                Assert.That(Utility.ParseBool(task.ExtraOptions!["no-auto-compact"], !bool.Parse(requestValue)), Is.EqualTo(bool.Parse(requestValue)));
+
+            // The options the task runs with: the backup's settings, then the task's own options, as Runner does
+            var backup = connection.GetBackup(backupId)!;
+            var options = Runner.ApplyOptions(connection, backup, Runner.GetCommonOptions(connection), out _);
+            foreach (var option in task.ExtraOptions!)
+                options[option.Key] = option.Value;
+
+            if (expectedEffective == null)
+                Assert.That(options.ContainsKey("no-auto-compact"), Is.False);
+            else
+                Assert.That(Utility.ParseBool(options["no-auto-compact"], !expectedEffective.Value), Is.EqualTo(expectedEffective.Value));
+
+            // The stored settings of the backup stay as they were
+            var stored = backup.Settings.Where(s => s.Name == "no-auto-compact").Select(s => s.Value).ToArray();
+            Assert.That(stored, Is.EqualTo(jobNoAutoCompact == null ? Array.Empty<string>() : new[] { jobNoAutoCompact }));
+
+            (await httpClient.PostAsync("/api/v1/serverstate/resume", null).ConfigureAwait(false)).EnsureSuccessStatusCode();
+            var stopwatch = Stopwatch.StartNew();
+            while (queueRunner.GetCurrentTasks().Count > 0 || queueRunner.GetCurrentTask() != null)
+            {
+                if (stopwatch.Elapsed > TimeSpan.FromMinutes(1))
+                    Assert.Fail("The queue did not empty");
+                await Task.Delay(100).ConfigureAwait(false);
+            }
+        }).ConfigureAwait(false);
     }
 
     private string BuildFileBackendUrl(string folder)

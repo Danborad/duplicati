@@ -32,6 +32,12 @@ internal partial class BackendManager : IBackendManager
     private readonly IChannel<PendingOperationBase> requestChannel = ChannelManager.CreateChannel<PendingOperationBase>(name: "BackendManager-" + Guid.NewGuid().ToString("N"));
 
     /// <summary>
+    /// How long disposing waits for the queue runner to stop. The runner closes the pooled backends
+    /// before it stops, which can take a few seconds for a backend that disconnects from a server.
+    /// </summary>
+    private static readonly TimeSpan QueueRunnerStopTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
     /// The queue runner task
     /// </summary>
     private readonly Task queueRunner;
@@ -60,6 +66,18 @@ internal partial class BackendManager : IBackendManager
     /// for backends that only understand a single flat namespace per URL.
     /// </summary>
     private readonly Lazy<bool> supportsFolderOperations;
+
+    /// <summary>
+    /// Indicates whether the backend can create hard links between relative paths.
+    /// Requires folder support as well, so both names are full relative paths.
+    /// </summary>
+    private readonly Lazy<bool> supportsHardLinks;
+
+    /// <summary>
+    /// Indicates whether the backend can delete a folder and its contents in one call.
+    /// Requires folder support as well, so the folder is a relative path.
+    /// </summary>
+    private readonly Lazy<bool> supportsFolderDelete;
 
     /// <summary>
     /// Flag keeping track of whether the object has been disposed
@@ -126,6 +144,9 @@ internal partial class BackendManager : IBackendManager
             }
         }, isThreadSafe: true);
 
+        supportsHardLinks = new Lazy<bool>(() => BackendIs<ILinkEnabledBackend>() && supportsFolderOperations.Value, isThreadSafe: true);
+        supportsFolderDelete = new Lazy<bool>(() => BackendIs<IFolderDeleteEnabledBackend>() && supportsFolderOperations.Value, isThreadSafe: true);
+
         // The BackendManager class is a wrapper that essentially sends
         // requests into a queue and processes them in order.
         // The Handler class is the one that actually processes the requests.
@@ -139,6 +160,57 @@ internal partial class BackendManager : IBackendManager
     /// Gets a value indicating whether the configured backend supports object locking
     /// </summary>
     public bool SupportsObjectLocking => supportsObjectLocking.Value;
+
+    /// <inheritdoc/>
+    public bool SupportsHardLinks => supportsHardLinks.Value;
+
+    /// <inheritdoc/>
+    public bool SupportsFolderDelete => supportsFolderDelete.Value;
+
+    /// <summary>
+    /// Checks whether the configured backend type implements a capability interface,
+    /// by creating and disposing a backend instance.
+    /// </summary>
+    /// <typeparam name="T">The capability interface</typeparam>
+    /// <returns><c>true</c> if the backend implements the interface</returns>
+    private bool BackendIs<T>()
+    {
+        var backend = DynamicLoader.BackendLoader.GetBackend(backendUrl, context.Options.RawOptions);
+        if (backend == null)
+            return false;
+        try
+        {
+            return backend is T;
+        }
+        finally
+        {
+            (backend as IDisposable)?.Dispose();
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task CreateHardLinkAsync(string existingPath, string targetPath, CancellationToken cancelToken)
+    {
+        if (!supportsHardLinks.Value)
+            throw new HardLinkNotSupportedException();
+
+        var op = new CreateHardLinkOperation(existingPath, targetPath, context, cancelToken);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        await op.GetResultAsync().ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task DeleteFolderRecursiveAsync(string path, CancellationToken cancelToken)
+    {
+        if (!supportsFolderDelete.Value)
+            throw new NotSupportedException("The backend cannot delete folders");
+        if (string.IsNullOrWhiteSpace(path))
+            throw new ArgumentException("Refusing to delete the backend root folder", nameof(path));
+
+        var op = new DeleteFolderOperation(path, context, cancelToken);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        await op.GetResultAsync().ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Enters a task into the queue for processing.
@@ -371,6 +443,21 @@ internal partial class BackendManager : IBackendManager
         return file;
     }
 
+    /// <inheritdoc/>
+    public async Task<TempFile> GetFileUnencryptedWithPathAsync(string remotename, CancellationToken cancelToken)
+    {
+        var op = new GetOperation(remotename, -1, context, cancelToken)
+        {
+            Hash = null,
+            Decrypt = false,
+            AllowParityRepair = false
+        };
+        ApplyPathTranslation(op);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        (var file, var _, var _) = await op.GetResultAsync().ConfigureAwait(false);
+        return file;
+    }
+
     /// <summary>
     /// Gets quota information from the backend
     /// </summary>
@@ -480,6 +567,7 @@ internal partial class BackendManager : IBackendManager
             TrackedInDb = true,
             IndexVolumeFinishedCallback = indexVolumeFinished,
             OnDbUpdate = onDbUpdate ?? PutOperation.OnDbUpdateDefault,
+            IsRemoteNameTaken = (volume as FilesetVolumeWriter)?.IsRemoteNameTaken,
         };
 
         // Prepare encryption
@@ -515,18 +603,10 @@ internal partial class BackendManager : IBackendManager
     public Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken)
         => PutFileUnencryptedWithPathAsync(remotename, tempFile, null, cancelToken);
 
-    /// <summary>
-    /// Uploads a file to the backend without encryption, treating the remote name
-    /// as a relative path that may contain sub-folders, and optionally setting the remote file's modification time.
-    /// </summary>
-    /// <param name="remotename">The relative path of the remote file, which may contain sub-folders</param>
-    /// <param name="tempFile">The temporary file to upload</param>
-    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
-    /// <param name="cancelToken">The cancellation token</param>
-    /// <returns>An awaitable task</returns>
-    public async Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken)
+    /// <inheritdoc />
+    public async Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModifiedUtc, CancellationToken cancelToken)
     {
-        var op = CreateUnencryptedPutOperation(remotename, tempFile, lastModificationUtc, cancelToken);
+        var op = CreateUnencryptedPutOperation(remotename, tempFile, lastModifiedUtc, cancelToken);
         ApplyPathTranslation(op);
         await QueueTaskAsync(op).ConfigureAwait(false);
         await op.GetResultAsync().ConfigureAwait(false);
@@ -538,12 +618,12 @@ internal partial class BackendManager : IBackendManager
     /// <param name="remotename">The relative path of the file to upload to, which may contain sub-folders</param>
     /// <param name="stream">The source stream to upload</param>
     /// <param name="size">The size of the source stream, or -1 if unknown</param>
-    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
+    /// <param name="lastModifiedUtc">The optional last modification time in UTC</param>
     /// <param name="cancelToken">The cancellation token</param>
     /// <returns>An awaitable task</returns>
-    public async Task PutStreamUnencryptedWithPathAsync(string remotename, System.IO.Stream stream, long size, DateTime? lastModificationUtc, CancellationToken cancelToken)
+    public async Task PutStreamUnencryptedWithPathAsync(string remotename, System.IO.Stream stream, long size, DateTime? lastModifiedUtc, CancellationToken cancelToken)
     {
-        var op = CreateUnencryptedStreamPutOperation(remotename, stream, size, lastModificationUtc, cancelToken);
+        var op = CreateUnencryptedStreamPutOperation(remotename, stream, size, lastModifiedUtc, cancelToken);
         ApplyPathTranslation(op);
         await QueueTaskAsync(op).ConfigureAwait(false);
         await op.GetResultAsync().ConfigureAwait(false);
@@ -552,7 +632,7 @@ internal partial class BackendManager : IBackendManager
     /// <summary>
     /// Creates a prepared operation for uploading a direct stream without encryption
     /// </summary>
-    private PutOperation CreateUnencryptedStreamPutOperation(string remotename, System.IO.Stream stream, long size, DateTime? lastModificationUtc, CancellationToken cancelToken)
+    private PutOperation CreateUnencryptedStreamPutOperation(string remotename, System.IO.Stream stream, long size, DateTime? lastModifiedUtc, CancellationToken cancelToken)
     {
         var op = new PutOperation(remotename, context, true, cancelToken)
         {
@@ -564,7 +644,7 @@ internal partial class BackendManager : IBackendManager
             OriginalIndexFile = null,
             IndexVolumeFinishedCallback = null,
             OnDbUpdate = PutOperation.OnDbUpdateDefault,
-            LastModificationUtc = lastModificationUtc,
+            LastModifiedUtc = lastModifiedUtc,
         };
 
         op.StartEncryptionAndHashing();
@@ -576,10 +656,10 @@ internal partial class BackendManager : IBackendManager
     /// </summary>
     /// <param name="remotename">The name of the remote file</param>
     /// <param name="tempFile">The temporary file to upload</param>
-    /// <param name="lastModificationUtc">The optional last modification time in UTC</param>
+    /// <param name="lastModifiedUtc">The optional last modification time in UTC</param>
     /// <param name="cancelToken">The cancellation token</param>
     /// <returns>The prepared put operation, ready to be queued</returns>
-    private PutOperation CreateUnencryptedPutOperation(string remotename, TempFile tempFile, DateTime? lastModificationUtc, CancellationToken cancelToken)
+    private PutOperation CreateUnencryptedPutOperation(string remotename, TempFile tempFile, DateTime? lastModifiedUtc, CancellationToken cancelToken)
     {
         var op = new PutOperation(remotename, context, true, cancelToken)
         {
@@ -589,7 +669,7 @@ internal partial class BackendManager : IBackendManager
             OriginalIndexFile = null,
             IndexVolumeFinishedCallback = null,
             OnDbUpdate = PutOperation.OnDbUpdateDefault,
-            LastModificationUtc = lastModificationUtc,
+            LastModifiedUtc = lastModifiedUtc,
         };
 
         // Sets the task as already completed
@@ -759,7 +839,7 @@ internal partial class BackendManager : IBackendManager
 
         if (!queueRunner.IsCompleted)
         {
-            Task.WhenAny(queueRunner, Task.Delay(1000)).Await();
+            Task.WhenAny(queueRunner, Task.Delay(QueueRunnerStopTimeout)).Await();
 
             if (!queueRunner.IsCompleted)
                 Logging.Log.WriteWarningMessage(LOGTAG, "BackendManagerShutdown", null, "Backend manager queue runner did not stop");

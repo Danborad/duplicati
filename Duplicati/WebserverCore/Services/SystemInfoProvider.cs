@@ -34,8 +34,26 @@ namespace Duplicati.WebserverCore.Services;
 /// <summary>
 /// Produces system information.
 /// </summary>
-public class SystemInfoProvider(IApplicationSettings applicationSettings, Connection connection) : ISystemInfoProvider
+public class SystemInfoProvider(IApplicationSettings applicationSettings, Connection connection, IUpdateInstallService updateInstallService) : ISystemInfoProvider
 {
+    /// <summary>
+    /// The API extension that signals backups can be enabled and disabled:
+    /// the backup "Enabled" field and the "/backup/{id}/enable" and "/backup/{id}/disable" endpoints
+    /// </summary>
+    public const string BackupEnableDisableExtension = "v1:backup:enable-disable";
+
+    /// <summary>
+    /// The API extension that signals Sync jobs can keep each run in a dated snapshot folder,
+    /// with the "sync-snapshot-folders" and "sync-keep-snapshots" options
+    /// </summary>
+    public const string SyncSnapshotsExtension = "v1:backup:sync-snapshots";
+
+    /// <summary>
+    /// The API extension that signals Sync jobs can be restored: listing versions and folders
+    /// and restoring through the same endpoints as a backup restore
+    /// </summary>
+    public const string SyncRestoreExtension = "v1:backup:sync-restore";
+
     /// <summary>
     /// The API extensions that are available
     /// </summary>
@@ -71,6 +89,10 @@ public class SystemInfoProvider(IApplicationSettings applicationSettings, Connec
         "v1:backup:restore-options",
         "v2:systemstatus",
         "v2:backup:restore-test",
+        BackupEnableDisableExtension,
+        SyncSnapshotsExtension,
+        SyncRestoreExtension,
+        "v2:backup:purge-files:suppress-compact",
 
         // "v1:subscribe:scheduler",
     ];
@@ -164,6 +186,16 @@ public class SystemInfoProvider(IApplicationSettings applicationSettings, Connec
         /// Gets or sets the package type ID.
         /// </summary>
         public required string PackageTypeId { get; init; }
+
+        /// <summary>
+        /// Gets or sets the name of the entry assembly.
+        /// </summary>
+        public required string EntryAssembly { get; init; }
+
+        /// <summary>
+        /// Gets or sets the installation folder.
+        /// </summary>
+        public required string InstallationFolder { get; init; }
 
         /// <summary>
         /// Gets or sets the user name.
@@ -294,6 +326,8 @@ public class SystemInfoProvider(IApplicationSettings applicationSettings, Connec
             CaseSensitiveFilesystem = Library.Utility.Utility.IsFSCaseSensitive,
             MachineName = Environment.MachineName,
             PackageTypeId = UpdaterManager.PackageTypeId,
+            EntryAssembly = Library.Utility.Utility.getEntryAssembly().GetName().Name ?? string.Empty,
+            InstallationFolder = UpdaterManager.INSTALLATIONDIR,
             UserName = OperatingSystem.IsWindows() ? System.Security.Principal.WindowsIdentity.GetCurrent().Name : Environment.UserName,
             NewLine = Environment.NewLine,
             CLRVersion = Environment.Version.ToString(),
@@ -376,7 +410,7 @@ public class SystemInfoProvider(IApplicationSettings applicationSettings, Connec
             DefaultUpdateChannel = systeminfo.DefaultUpdateChannel,
             DefaultUsageReportLevel = systeminfo.DefaultUsageReportLevel,
             ServerTime = DateTime.Now,
-            ServerTimeZone = TimeZoneInfo.Local.Id,
+            ServerTimeZone = connection.ApplicationSettings.Timezone.Id,
             OSType = systeminfo.OSType,
             OSVersion = systeminfo.OSVersion,
             DirectorySeparator = systeminfo.DirectorySeparator,
@@ -384,6 +418,11 @@ public class SystemInfoProvider(IApplicationSettings applicationSettings, Connec
             CaseSensitiveFilesystem = systeminfo.CaseSensitiveFilesystem,
             MachineName = systeminfo.MachineName,
             PackageTypeId = systeminfo.PackageTypeId,
+            EntryAssembly = systeminfo.EntryAssembly,
+            InstallationFolder = systeminfo.InstallationFolder,
+            DataFolder = applicationSettings.DataFolder,
+            UpdateInstallSupported = updateInstallService.Support.Supported,
+            UpdateInstallUnsupportedReason = updateInstallService.Support.Reason,
             UserName = systeminfo.UserName,
             NewLine = systeminfo.NewLine,
             CLRVersion = systeminfo.CLRVersion,

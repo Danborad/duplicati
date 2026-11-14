@@ -357,7 +357,7 @@ namespace Duplicati.UnitTest
 
             // The remote URL is captured via the IGenericCallbackModule.OnStart hook, mirroring
             // ReportHelper. Drive it to populate the backup id and destination type.
-            var remoteUrl = "s3://mybucket/path";
+            var remoteUrl = "s3://mybucket/path?s3-server-name=nas.internal.example.com";
             var localPaths = new[] { "/data/source" };
             module.OnStart("Backup", ref remoteUrl, ref localPaths);
             await module.OnOperationStartedAsync("Backup", null!, CancellationToken.None);
@@ -373,6 +373,8 @@ namespace Duplicati.UnitTest
             Assert.AreEqual("s3", metadata.DestinationType, "DestinationType should be the remote URL scheme");
             Assert.IsFalse(string.IsNullOrEmpty(metadata.OperatingSystem), "OperatingSystem should be populated");
             Assert.IsFalse(string.IsNullOrEmpty(metadata.OperatingSystemDetailed), "OperatingSystemDetailed should be populated");
+            Assert.IsFalse(string.IsNullOrEmpty(metadata.InstallationType), "InstallationType should be populated");
+            Assert.IsFalse(string.IsNullOrEmpty(metadata.EntryAssembly), "EntryAssembly should be populated");
 
             // The backup id is a stable hex string derived from the remote URL.
             Assert.That(metadata.BackupId, Does.Match("^[0-9a-fA-F]+$"));
@@ -388,7 +390,7 @@ namespace Duplicati.UnitTest
             using var module = CreateConfigured();
 
             // An s3 URL against a recognized public-cloud host suffix yields that suffix.
-            var remoteUrl = "s3://mybucket.s3.amazonaws.com/path";
+            var remoteUrl = "s3://mybucket/path?s3-server-name=s3.eu-west-1.amazonaws.com";
             var localPaths = new[] { "/data/source" };
             module.OnStart("Backup", ref remoteUrl, ref localPaths);
             await module.OnOperationStartedAsync("Backup", null!, CancellationToken.None);

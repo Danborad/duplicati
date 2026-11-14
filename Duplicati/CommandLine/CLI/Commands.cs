@@ -761,6 +761,10 @@ namespace Duplicati.CommandLine
                         if (output.FullResults)
                             Library.Utility.Utility.PrintSerializeObject(res, outwriter);
 
+                        // Files that could not be restored are reported as errors, while the other files are restored
+                        if (res.ParsedResult == Library.Interface.ParsedResultType.Error)
+                            return 3;
+
                         if (res.Warnings.Any())
                             return 2;
                     }
@@ -929,8 +933,12 @@ namespace Duplicati.CommandLine
             {
                 if (new string[] { "all", "everything" }.Contains(args[1], StringComparer.OrdinalIgnoreCase))
                     tests = long.MaxValue;
-                else
-                    tests = Convert.ToInt64(args[1]);
+                // The Commandline page of the UI can leave the backup sources here, so say what is wrong instead of crashing
+                else if (!long.TryParse(args[1], out tests))
+                {
+                    outwriter.WriteLine(Strings.Program.InvalidTestSampleCountError(args[1]));
+                    return 200;
+                }
             }
 
             Library.Interface.ITestResults result;

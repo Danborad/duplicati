@@ -111,6 +111,57 @@ namespace Duplicati.Library.Main.Operation.Common
         }
 
         /// <summary>
+        /// A filter entry that starts with <c>?:</c> names a path at the root of any drive, such as the
+        /// <c>?:\$Recycle.Bin\</c> of the default excludes (the filter groups are expanded into their
+        /// entries when the filter is made). A remote source is mounted below a folder instead of on a
+        /// drive, so these entries did not reach the root of the share. For each remote source, this adds
+        /// each such entry again with the mount point in place of the drive, right after the entry and with
+        /// its sign, so the filter keeps its order.
+        /// </summary>
+        /// <param name="filter">The filter to extend</param>
+        /// <param name="sources">The sources of the operation</param>
+        /// <returns>The extended filter, or the same instance if nothing was added</returns>
+        public static IFilter? AddDriveRootEntriesForRemoteSources(IFilter? filter, IEnumerable<string> sources)
+        {
+            if (filter == null || filter.Empty)
+                return filter;
+
+            // A mount point that is not a valid rooted path is reported when the source is loaded,
+            // and one with a wildcard character would make the added entries match more than the share
+            var mountpoints = sources
+                .Select(ParseRemoteSource)
+                .OfType<RemoteSource>()
+                .Select(x => x.Mountpoint)
+                .Where(x => Path.IsPathRooted(x) && !x.Any(c => c == '*' || c == '?' || Path.GetInvalidPathChars().Contains(c)))
+                .Select(x => NormalizeMountpoint(x).TrimEnd(Path.DirectorySeparatorChar))
+                .Distinct(Library.Utility.Utility.ClientFilenameStringComparer)
+                .ToList();
+            if (mountpoints.Count == 0)
+                return filter;
+
+            var entries = FilterExpression.Serialize(filter);
+            var result = new List<string>(entries.Length);
+            var added = false;
+            foreach (var entry in entries)
+            {
+                result.Add(entry);
+
+                // The entry is the sign followed by the expression; "?:" followed by a separator is a drive root
+                if (entry.Length < 4 || entry[1] != '?' || entry[2] != ':' || (entry[3] != '\\' && entry[3] != '/'))
+                    continue;
+
+                var rest = entry.Substring(3);
+                foreach (var mountpoint in mountpoints)
+                {
+                    result.Add(entry[0] + mountpoint + rest);
+                    added = true;
+                }
+            }
+
+            return added ? FilterExpression.Deserialize(result.ToArray()) : filter;
+        }
+
+        /// <summary>
         /// Translates a single serialized filter entry, see <see cref="TranslatePrefixedFilters"/>
         /// </summary>
         /// <param name="entry">The serialized entry, starting with <c>+</c> or <c>-</c></param>
@@ -159,28 +210,64 @@ namespace Duplicati.Library.Main.Operation.Common
             if (sources == null || options.ContainsKey(StoreMetadataContentInDatabaseOption))
                 return false;
 
+            var provider = FindSourceProviderWith(sources, x => x.NeedsStoredMetadata);
+            if (provider == null)
+                return false;
+
+            Log.WriteInformationMessage(LOGTAG, "AutoEnableMetadataStorage", "The source provider \"{0}\" requires metadata to be stored in the database, automatically enabling the option --{1}", provider, StoreMetadataContentInDatabaseOption);
+            options[StoreMetadataContentInDatabaseOption] = "true";
+            return true;
+        }
+
+        /// <summary>
+        /// Sets the "filter-case-sensitivity" option to case-sensitive if any of the sources
+        /// is provided by a source provider that names its items with case-sensitive paths,
+        /// and the option is not already set
+        /// </summary>
+        /// <param name="sources">The sources to check</param>
+        /// <param name="options">The options to update</param>
+        /// <returns>True if the option was set; false otherwise</returns>
+        public static bool EnableCaseSensitiveFiltersIfRequiredBySources(IEnumerable<string>? sources, IDictionary<string, string?> options)
+        {
+            if (sources == null || options.ContainsKey(Options.FILTER_CASE_SENSITIVITY_OPTION))
+                return false;
+
+            var provider = FindSourceProviderWith(sources, x => x.NeedsCaseSensitiveFilters);
+            if (provider == null)
+                return false;
+
+            var value = nameof(Options.FilterCaseSensitivityMode.Sensitive).ToLowerInvariant();
+            Log.WriteInformationMessage(LOGTAG, "AutoEnableCaseSensitiveFilters", "The source provider \"{0}\" names its items with case-sensitive paths, automatically setting the option --{1}={2}", provider, Options.FILTER_CASE_SENSITIVITY_OPTION, value);
+            options[Options.FILTER_CASE_SENSITIVITY_OPTION] = value;
+            return true;
+        }
+
+        /// <summary>
+        /// Finds the first source provider that serves one of the sources and matches the predicate
+        /// </summary>
+        /// <param name="sources">The sources to check</param>
+        /// <param name="predicate">The predicate the source provider must match</param>
+        /// <returns>The key of the matching source provider, or <c>null</c> if no source uses one</returns>
+        private static string? FindSourceProviderWith(IEnumerable<string> sources, Func<ISourceProvider, bool> predicate)
+        {
             var sourcesList = sources as IReadOnlyList<string> ?? sources.ToList();
 
-            // Check if any prefix-based source providers that require metadata match the sources.
-            // A provider that is not supported on this platform will not serve the source,
-            // so it has no metadata to store either
-            if (SourceProviders.SourceProviderModules.BuiltInPrefixSourceProviderModules
-                .Where(x => x.NeedsStoredMetadata && x.IsSupported)
-                .Any(m => sourcesList.Any(m.MatchesSource)))
-            {
-                Log.WriteInformationMessage(LOGTAG, "AutoEnableMetadataStorage", "A prefix-based source provider requires metadata to be stored in the database, automatically enabling the option --{0}", StoreMetadataContentInDatabaseOption);
-                options[StoreMetadataContentInDatabaseOption] = "true";
-                return true;
-            }
+            // Check if any prefix-based source providers that match the predicate serve the sources.
+            // A provider that is not supported on this platform will not serve the source
+            var prefixProvider = SourceProviders.SourceProviderModules.BuiltInPrefixSourceProviderModules
+                .Where(x => predicate(x) && x.IsSupported)
+                .FirstOrDefault(m => sourcesList.Any(m.MatchesSource));
+            if (prefixProvider != null)
+                return prefixProvider.Key;
 
-            // Find the keys of the source providers that require metadata to be stored in the database
-            var providersRequiringMetadata = SourceProviderLoader.Modules
-                .Where(x => x.NeedsStoredMetadata)
+            // Find the keys of the source providers that match the predicate
+            var matchingProviders = SourceProviderLoader.Modules
+                .Where(x => predicate(x))
                 .Select(x => x.Key)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            if (providersRequiringMetadata.Count == 0)
-                return false;
+            if (matchingProviders.Count == 0)
+                return null;
 
             foreach (var source in sourcesList)
             {
@@ -199,15 +286,11 @@ namespace Duplicati.Library.Main.Operation.Common
                     continue;
                 }
 
-                if (providersRequiringMetadata.Contains(scheme))
-                {
-                    Log.WriteInformationMessage(LOGTAG, "AutoEnableMetadataStorage", "The source provider \"{0}\" requires metadata to be stored in the database, automatically enabling the option --{1}", scheme, StoreMetadataContentInDatabaseOption);
-                    options[StoreMetadataContentInDatabaseOption] = "true";
-                    return true;
-                }
+                if (matchingProviders.Contains(scheme))
+                    return scheme;
             }
 
-            return false;
+            return null;
         }
 
         /// <summary>
@@ -277,6 +360,20 @@ namespace Duplicati.Library.Main.Operation.Common
                 enableAdsBackup: options.EnableAdsBackup,
                 macOSPhotosHandling: options.HandleMacOSPhotoLibrary,
                 photosLibraryPath: options.MacOSPhotoLibraryPath);
+        }
+
+        /// <summary>
+        /// Checks if a source is a plain local path that is handled by the local file source
+        /// </summary>
+        /// <param name="source">The source to check</param>
+        /// <returns>True if the source is a local file or folder</returns>
+        public static bool IsLocalFileSource(string source)
+        {
+            if (string.IsNullOrWhiteSpace(source) || source.StartsWith("@"))
+                return false;
+            if (SourceProviders.SourceProviderModules.BuiltInPrefixSourceProviderModules.Any(m => m.MatchesSource(source)))
+                return false;
+            return "file".Equals(Duplicati.Library.Utility.Utility.GuessScheme(source) ?? "file", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -506,6 +603,8 @@ namespace Duplicati.Library.Main.Operation.Common
 
         /// <inheritdoc />
         public bool NeedsStoredMetadata => inner.NeedsStoredMetadata;
+        /// <inheritdoc />
+        public bool NeedsCaseSensitiveFilters => inner.NeedsCaseSensitiveFilters;
 
         /// <inheritdoc />
         public Task InitializeAsync(CancellationToken cancellationToken) => inner.InitializeAsync(cancellationToken);

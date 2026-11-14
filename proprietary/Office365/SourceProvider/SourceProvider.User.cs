@@ -990,6 +990,14 @@ partial class SourceProvider
     internal ChatApiImpl ChatApi => new ChatApiImpl(_apiHelper);
     internal class ChatApiImpl(APIHelper provider)
     {
+        /// <summary>
+        /// Gets the id of the tenant being backed up, which the chats it hosts carry
+        /// </summary>
+        /// <param name="ct">The cancellation token</param>
+        /// <returns>The tenant id, or <c>null</c> if it cannot be determined</returns>
+        internal Task<string?> GetOwnTenantIdAsync(CancellationToken ct)
+            => provider.GetTenantIdAsync(ct);
+
         internal IAsyncEnumerable<GraphChat> ListUserChatsAsync(string userIdOrUpn, CancellationToken ct)
         {
             var baseUrl = provider.GraphBaseUrl.TrimEnd('/');
@@ -1009,15 +1017,9 @@ partial class SourceProvider
             var baseUrl = provider.GraphBaseUrl.TrimEnd('/');
             var chat = Uri.EscapeDataString(chatId);
 
-            var select = GraphSelectBuilder.BuildSelect<GraphChatMember>(
-                // userId is defined on the derived aadUserConversationMember type; it is returned
-                // but cannot be selected on the conversationMember collection
-                exclude: [nameof(GraphChatMember.UserId)]
-            );
-            var url =
-                $"{baseUrl}/v1.0/chats/{chat}/members" +
-                $"?$select={Uri.EscapeDataString(select)}" +
-                $"&$top={APIHelper.GENERAL_PAGE_SIZE}";
+            // The chat members endpoint does not support any OData query options;
+            // Graph rejects $top with HTTP 400, so the request carries no $select or $top
+            var url = $"{baseUrl}/v1.0/chats/{chat}/members";
 
             return provider.GetAllGraphItemsAsync<GraphChatMember>(url, ct);
         }
@@ -1027,13 +1029,10 @@ partial class SourceProvider
             var baseUrl = provider.GraphBaseUrl.TrimEnd('/');
             var chat = Uri.EscapeDataString(chatId);
 
-            var select = GraphSelectBuilder.BuildSelect<GraphChatMessage>();
-
-            // Chat messages reject $top values above 50
+            // Chat messages support only $top (max 50), $orderby and $filter; $select is not supported
             var url =
                 $"{baseUrl}/v1.0/chats/{chat}/messages" +
-                $"?$select={Uri.EscapeDataString(select)}" +
-                $"&$top={APIHelper.CHATS_PAGE_SIZE}";
+                $"?$top={APIHelper.CHATS_PAGE_SIZE}";
 
             return provider.GetAllGraphItemsAsync<GraphChatMessage>(url, ct);
         }

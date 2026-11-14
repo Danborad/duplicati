@@ -77,6 +77,18 @@ namespace Duplicati.Library.Main
         private bool m_operationStarted = false;
 
         /// <summary>
+        /// Set while an operation runs that reads a sync job's destination, such as listing
+        /// or restoring its snapshots. Such an operation uses the sync database of the job,
+        /// which has its own schema and must never be opened as a backup database.
+        /// </summary>
+        private bool m_syncDatabaseOperation;
+
+        /// <summary>
+        /// Whether the current operation keeps its state in the sync database
+        /// </summary>
+        private bool UsesSyncDatabase => m_options.MainAction == OperationMode.Sync || m_syncDatabaseOperation;
+
+        /// <summary>
         /// A stop asked for before the first operation started, applied when it starts
         /// </summary>
         private bool m_stopBeforeStart = false;
@@ -126,6 +138,14 @@ namespace Duplicati.Library.Main
         public Action<IBasicResults, Exception> OnOperationCompleted { get; set; }
 
         /// <summary>
+        /// The names of the options that stop the operation when they are not supported, instead of
+        /// being ignored with a warning. The command line sets it to the options that were typed, so
+        /// a misspelled option does not run the operation without it, while saved jobs and the
+        /// options of modules that are not loaded keep working elsewhere.
+        /// </summary>
+        public IReadOnlySet<string> RejectUnsupportedOptions { get; set; }
+
+        /// <summary>
         /// Constructs a new interface for performing backup and restore operations
         /// </summary>
         /// <param name="backendUrl">The url for the backend to use</param>
@@ -154,6 +174,18 @@ namespace Duplicati.Library.Main
             return Task.CompletedTask;
         }
 
+        /// <summary>
+        /// The provider that supplies a backup with the paths that changed since the previous backup, if any
+        /// </summary>
+        public IChangeListProvider ChangeListProvider { get; private set; }
+
+        /// <inheritdoc />
+        public Task SetChangeListProviderAsync(IChangeListProvider changeListProvider)
+        {
+            ChangeListProvider = changeListProvider;
+            return Task.CompletedTask;
+        }
+
         /// <inheritdoc />
         public async Task<IBackupResults> BackupAsync(string[] inputsources, IFilter inputFilter = null)
         {
@@ -171,11 +203,12 @@ namespace Duplicati.Library.Main
             CheckAutoCompactInterval();
             CheckAutoVacuumInterval();
             SourceProviderFactory.EnableMetadataStorageIfRequiredBySources(inputsources, m_options.RawOptions);
+            SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(inputsources, m_options.RawOptions);
 
-            return await RunActionAsync(new BackupResults(), inputsources, inputFilter, new { lastRestoreTest = m_lastRestoreTest }, static async config =>
+            return await RunActionAsync(new BackupResults(), inputsources, inputFilter, new { lastRestoreTest = m_lastRestoreTest, changeListProvider = ChangeListProvider }, static async config =>
             {
                 var (expandedSources, filter) = ExpandInputSources(config.Paths, config.Filter, config.Options);
-                using (var h = new Operation.BackupHandler(config.Options, config.Result))
+                using (var h = new Operation.BackupHandler(config.Options, config.Result, config.Context.changeListProvider))
                     await h.RunAsync(expandedSources, config.BackendManager, filter)
                         .ConfigureAwait(false);
 
@@ -289,10 +322,16 @@ namespace Duplicati.Library.Main
                     .RunAsync(config.Context.paths, config.BackendManager, config.Filter, restoreDestination, config.BackendUrl)
                     .ConfigureAwait(false);
 
+                // A stopped restore, or one where files failed, returns normally; the
+                // destination is told, so it does not present the result as complete
+                var isComplete = !config.Result.TaskControl.StopToken.IsCancellationRequested
+                    && config.Result.BrokenLocalFiles.Count == 0
+                    && config.Result.BrokenRemoteFiles.Count == 0;
+
                 await restoreDestination.Finalize((pg) =>
                 {
                     config.Result.OperationProgressUpdater.UpdateProgress((float)pg);
-                }, config.Result.TaskControl.ProgressToken).ConfigureAwait(false);
+                }, isComplete, config.Result.TaskControl.ProgressToken).ConfigureAwait(false);
                 config.Result.OperationProgressUpdater.UpdatePhase(OperationPhase.Restore_Complete);
                 config.Result.EndTime = DateTime.UtcNow;
 
@@ -547,6 +586,7 @@ namespace Duplicati.Library.Main
         {
             m_options.RawOptions["dry-run"] = "true";
             m_options.RawOptions["dbpath"] = "INVALID!";
+            SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(paths, m_options.RawOptions);
 
             // Redirect all messages from the filter to the message sink
             var filtertag = Logging.Log.LogTagFromType(typeof(Operation.Backup.FileEnumerationProcess));
@@ -633,11 +673,50 @@ namespace Duplicati.Library.Main
         public async Task<ISyncResults> SyncAsync(string[] sourcePaths, IFilter filter)
         {
             SourceProviderFactory.EnableMetadataStorageIfRequiredBySources(sourcePaths, m_options.RawOptions);
+            SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(sourcePaths, m_options.RawOptions);
 
             return await RunActionAsync(new SyncResults(), sourcePaths, filter, false, config =>
                 new Operation.Sync.SyncHandler(config.Paths, config.Options, config.Result, config.BackendUrl)
                     .RunAsync(config.BackendManager, config.Filter)
             );
+        }
+
+        /// <inheritdoc />
+        public async Task<IListFilesetResults> ListSyncVersionsAsync()
+            => await RunSyncDatabaseActionAsync(() => RunActionAsync(new ListFilesetResults(), null, null, false, static config =>
+                Operation.Sync.SyncRestoreHandler.ListVersionsAsync(config.Options, config.Result, config.BackendManager)
+            )).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public async Task<IListFolderResults> ListSyncFolderAsync(string[] sourcePaths, string[] folders, long offset, long limit)
+            => await RunSyncDatabaseActionAsync(() => RunActionAsync(new ListFolderResults(), null, null, new { sourcePaths, folders, offset, limit }, static config =>
+                Operation.Sync.SyncRestoreHandler.ListFolderAsync(config.Options, config.Result, config.BackendManager, config.Context.sourcePaths, config.Context.folders, config.Context.offset, config.Context.limit)
+            )).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public async Task<IRestoreResults> SyncRestoreAsync(string[] sourcePaths, string[] paths)
+            => await RunSyncDatabaseActionAsync(() => RunActionAsync(new RestoreResults(), null, null, new { sourcePaths, paths }, static config =>
+                Operation.Sync.SyncRestoreHandler.RestoreAsync(config.Options, config.Result, config.BackendManager, config.Context.sourcePaths, config.Context.paths)
+            )).ConfigureAwait(false);
+
+        /// <summary>
+        /// Runs an operation that reads a sync job's destination, marking it as one that
+        /// uses the sync database for as long as it runs.
+        /// </summary>
+        /// <typeparam name="TRes">The result type</typeparam>
+        /// <param name="action">The operation</param>
+        /// <returns>The result of the operation</returns>
+        private async Task<TRes> RunSyncDatabaseActionAsync<TRes>(Func<Task<TRes>> action)
+        {
+            m_syncDatabaseOperation = true;
+            try
+            {
+                return await action().ConfigureAwait(false);
+            }
+            finally
+            {
+                m_syncDatabaseOperation = false;
+            }
         }
 
         public async Task<IVacuumResults> VacuumAsync()
@@ -709,6 +788,11 @@ namespace Duplicati.Library.Main
                     result.MessageSink = m_messageSink;
                     Logging.Log.WriteInformationMessage(LOGTAG, "StartingOperation", Strings.Controller.StartingOperationMessage(m_options.MainAction));
 
+                    // The filter that was passed in gets the case-sensitivity of the operation,
+                    // and so do the filters that the operation creates from here on
+                    filter = FilterExpression.WithCaseSensitivity(filter, m_options.FilterCaseSensitive);
+
+                    using (FilterExpression.StartCaseSensitivityScope(m_options.FilterCaseSensitive))
                     using (SlowQueryMonitor.StartMonitoring(m_options.SlowQueryThreshold))
                     using (new ProcessController(m_options))
                     using (new Logging.Timer(LOGTAG, string.Format("Run{0}", result.MainOperation), string.Format("Running {0}", result.MainOperation)))
@@ -716,7 +800,7 @@ namespace Duplicati.Library.Main
                     using (m_options.ConcurrencyMaxThreads <= 0 ? null : new CoCoL.CappedThreadedThreadPool(m_options.ConcurrencyMaxThreads))
                     // Sync keeps its own intent journal and does not record a remote operation log,
                     // so the messages are never flushed and must not be collected in memory
-                    using (var backend = new Backend.BackendManager(m_backendUrl, m_options, result.BackendWriter, result.TaskControl, collectDatabaseMessages: m_options.MainAction != OperationMode.Sync))
+                    using (var backend = new Backend.BackendManager(m_backendUrl, m_options, result.BackendWriter, result.TaskControl, collectDatabaseMessages: !UsesSyncDatabase))
                     {
                         try
                         {
@@ -740,7 +824,7 @@ namespace Duplicati.Library.Main
                             // instead of relying on the operations to correctly toggle the flag
                             //
                             // The sync operation owns its own database and records its own audit log.
-                            if (File.Exists(m_options.Dbpath) && !m_options.NoLocalDb && m_options.MainAction != OperationMode.Sync)
+                            if (File.Exists(m_options.Dbpath) && !m_options.NoLocalDb && !UsesSyncDatabase)
                             {
                                 try
                                 {
@@ -772,7 +856,7 @@ namespace Duplicati.Library.Main
                     // (Operation, LogData, DeletedVolume tables). The sync database has its own
                     // schema, so sync operations write their results through the sync database
                     // instead of running incompatible SQL against it.
-                    if (File.Exists(m_options.Dbpath) && !m_options.Dryrun && m_options.MainAction != OperationMode.Sync)
+                    if (File.Exists(m_options.Dbpath) && !m_options.Dryrun && !UsesSyncDatabase)
                     {
                         try
                         {
@@ -803,7 +887,7 @@ namespace Duplicati.Library.Main
                             Logging.Log.WriteWarningMessage(LOGTAG, "FailedWriteOperation", ex, "Failed to write operation results to database: {0}", ex.Message);
                         }
                     }
-                    else if (m_options.MainAction == OperationMode.Sync)
+                    else if (UsesSyncDatabase)
                     {
                         try
                         {
@@ -835,7 +919,7 @@ namespace Duplicati.Library.Main
                     {
                         // No operation was started in database, so write logs to new operation.
                         // Sync uses its own database schema
-                        if (m_options.MainAction == OperationMode.Sync)
+                        if (UsesSyncDatabase)
                             await WriteSyncResultsAsync(result, false).ConfigureAwait(false);
                         else if (File.Exists(m_options.Dbpath) && !m_options.Dryrun)
                             await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, result.MainOperation.ToString(), true, null, CancellationToken.None).ConfigureAwait(false))
@@ -874,7 +958,7 @@ namespace Duplicati.Library.Main
                     {
                         // Write logs to previous operation if database exists.
                         // Sync uses its own database schema
-                        if (m_options.MainAction == OperationMode.Sync)
+                        if (UsesSyncDatabase)
                             await WriteSyncResultsAsync(result, false).ConfigureAwait(false);
                         else if (File.Exists(m_options.Dbpath) && !m_options.Dryrun)
                             await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, null, true, null, CancellationToken.None).ConfigureAwait(false))
@@ -906,7 +990,7 @@ namespace Duplicati.Library.Main
                         resultSetter.Fatal = true;
                         // Write logs to previous operation if database exists.
                         // Sync uses its own database schema
-                        if (m_options.MainAction == OperationMode.Sync)
+                        if (UsesSyncDatabase)
                             await WriteSyncResultsAsync(result, false).ConfigureAwait(false);
                         else if (File.Exists(m_options.Dbpath) && !m_options.Dryrun)
                             await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, null, true, null, CancellationToken.None).ConfigureAwait(false))
@@ -941,6 +1025,10 @@ namespace Duplicati.Library.Main
         private async Task WriteSyncResultsAsync(IBasicResults result, bool purgeOldResults)
         {
             if (!File.Exists(m_options.Dbpath) || m_options.Dryrun)
+                return;
+
+            // Browsing a sync job's snapshots is not an event for the job log; a restore is
+            if (result is not ISyncResults and not IRestoreResults)
                 return;
 
             using var db = new LocalSyncDatabase(m_options.Dbpath);
@@ -1098,7 +1186,7 @@ namespace Duplicati.Library.Main
             }
 
             if (string.IsNullOrEmpty(m_options.Dbpath))
-                m_options.Dbpath = CLIDatabaseLocator.GetDatabasePathForCLI(m_backendUrl, m_options, true, false, m_options.MainAction == OperationMode.Sync);
+                m_options.Dbpath = CLIDatabaseLocator.GetDatabasePathForCLI(m_backendUrl, m_options, true, false, UsesSyncDatabase);
 
             RestoreOptionsFromExistingDatabase(result.MainOperation);
 
@@ -1227,14 +1315,26 @@ namespace Duplicati.Library.Main
             // backup LocalDatabase, and does not store options to restore. Opening it as a
             // backup database would run the backup schema upgrade against an incompatible
             // schema and throw. Sync reads its options directly from the command-line dict.
-            if (operation == OperationMode.Sync)
+            if (UsesSyncDatabase)
                 return;
 
             if (m_options.NoLocalDb || string.IsNullOrWhiteSpace(m_options.Dbpath) || !File.Exists(m_options.Dbpath))
                 return;
 
-            using var db = LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, operation.ToString(), true, null, CancellationToken.None).Await();
-            Utility.UpdateOptionsFromDbAsync(db, m_options, CancellationToken.None).Await();
+            LocalDatabase db;
+            try
+            {
+                db = LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, operation.ToString(), true, null, CancellationToken.None).Await();
+            }
+            // A repair sets an unreadable database aside and recreates it, so it must get to do that
+            catch (Exception ex) when (operation == OperationMode.Repair)
+            {
+                Logging.Log.WriteInformationMessage(LOGTAG, "SkipOptionsFromUnreadableDatabase", "Not reading the options stored in the local database {0}, as it cannot be opened: {1}", m_options.Dbpath, ex.Message);
+                return;
+            }
+
+            using (db)
+                Utility.UpdateOptionsFromDbAsync(db, m_options, CancellationToken.None).Await();
         }
 
         private async Task ApplySecretProviderAsync(CancellationToken cancellationToken)
@@ -1304,6 +1404,10 @@ namespace Duplicati.Library.Main
                 throw new UserInformationException(string.Format("Setting multiple retention options ({0}) is not permitted",
                     string.Join(", ", selectedRetentionOptions.Select(x => "--" + x))), "MultipleRetentionOptionsNotSupported");
             }
+
+            // The files not in the list are copied from the previous version, and a file can cross a moving limit without being changed
+            if (m_options.HasMovingModifiedTimeLimit && m_options.ChangedFilelist is { Length: > 0 })
+                throw new UserInformationException("A modification time limit given relative to now, such as --skip-files-modified-after=1W, cannot be combined with --changed-files. Give the limit as a date instead.", "MovingTimeLimitWithChangedFiles");
 
             // Check Prefix
             if (!string.IsNullOrWhiteSpace(m_options.Prefix) && m_options.Prefix.Contains("-"))
@@ -1491,12 +1595,20 @@ namespace Duplicati.Library.Main
             }
 
             //Now look for options that were supplied but not supported
+            var rejectedOptions = new List<string>();
             foreach (var s in ropts.Keys)
                 if (!supportedOptions.ContainsKey(s))
-                    if (disabledModuleOptions.ContainsKey(s))
+                    if (RejectUnsupportedOptions != null && RejectUnsupportedOptions.Contains(s))
+                        rejectedOptions.Add(disabledModuleOptions.TryGetValue(s, out var module)
+                            ? Strings.Controller.UnsupportedOptionDisabledModuleError(s, module)
+                            : Strings.Controller.UnsupportedOptionError(s));
+                    else if (disabledModuleOptions.ContainsKey(s))
                         Logging.Log.WriteWarningMessage(LOGTAG, "UnsupportedDisabledModule", null, Strings.Controller.UnsupportedOptionDisabledModuleWarning(s, disabledModuleOptions[s]), null);
                     else
                         Logging.Log.WriteWarningMessage(LOGTAG, "UnsupportedOption", null, Strings.Controller.UnsupportedOptionWarning(s), null);
+
+            if (rejectedOptions.Count > 0)
+                throw new UserInformationException(string.Join(Environment.NewLine, rejectedOptions), "UnsupportedOptionGiven");
 
             //Look at the value supplied for each argument and see if is valid according to its type
             foreach (var s in ropts.Keys)
@@ -1575,6 +1687,9 @@ namespace Duplicati.Library.Main
 
             // Filters may name the content of a prefix-based source provider the same way as the sources do
             filter = SourceProviderFactory.TranslatePrefixedFilters(filter);
+
+            // What the filter names at the root of a drive is also at the root of a share
+            filter = SourceProviderFactory.AddDriveRootEntriesForRemoteSources(filter, inputsources);
 
             DriveInfo[] drives = null;
 

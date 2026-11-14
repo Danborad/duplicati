@@ -76,6 +76,10 @@ partial class BackendManager
         /// </summary>
         public required bool Unencrypted { get; set; }
         /// <summary>
+        /// The modification time to record on the remote file, if the backend supports it
+        /// </summary>
+        public DateTime? LastModifiedUtc { get; set; }
+        /// <summary>
         /// The local filename as a string
         /// </summary>
         public string LocalFilename => LocalTempfile;
@@ -108,9 +112,15 @@ partial class BackendManager
         /// </summary>
         public required Func<Task>? IndexVolumeFinishedCallback { get; init; }
         /// <summary>
-        /// The optional source file modification time in UTC to preserve on the destination
+        /// <summary>
+        /// Checks if a remote name is already in use, before the file is renamed after a failed upload.
+        /// Only set for files whose name is not unique by itself.
         /// </summary>
-        public DateTime? LastModificationUtc { get; init; }
+        public Func<string, CancellationToken, Task<bool>>? IsRemoteNameTaken { get; init; }
+        /// <summary>
+        /// The number of names tried when renaming after a failed upload, as when probing for a dlist name
+        /// </summary>
+        private const int MaxRenameTries = 60;
         /// <summary>
         /// The default callback for database updates (no-op)
         /// </summary>
@@ -261,7 +271,7 @@ partial class BackendManager
             // If we have previously attempted to upload, we need to rename the file
             if (operationState == OperationState.Uploading && TrackedInDb)
             {
-                RenameFileAfterError(size);
+                await RenameFileAfterErrorAsync(size, cancelToken).ConfigureAwait(false);
                 await OnDbUpdate().ConfigureAwait(false);
             }
 
@@ -312,7 +322,17 @@ partial class BackendManager
             try
             {
                 Context.ProgressHandler.BeginTransfer(BackendActionType.Put, size, RemoteFilename);
-                if (backend is IStreamingBackend streamingBackend && streamingBackend.SupportsStreaming && !Context.Options.DisableStreamingTransfers)
+                if (LastModifiedUtc.HasValue && backend is IModificationTimeEnabledBackend timeBackend)
+                {
+                    var dataStream = SourceStream ?? System.IO.File.OpenRead(LocalFilename);
+                    using (SourceStream != null ? null : dataStream)
+                    using (var ts = new ThrottleEnabledStream(dataStream, Context.UploadThrottleManager, Context.DownloadThrottleManager))
+                    using (var pgs = new ProgressReportingStream(ts, pg => Context.ProgressHandler.HandleProgress(pg, RemoteFilename)))
+                    {
+                        await timeBackend.PutAsync(effectiveName, pgs, LastModifiedUtc.Value, cancelToken).ConfigureAwait(false);
+                    }
+                }
+                else if (backend is IStreamingBackend streamingBackend && streamingBackend.SupportsStreaming && !Context.Options.DisableStreamingTransfers)
                 {
                     var dataStream = SourceStream ?? System.IO.File.OpenRead(LocalFilename);
                     using (SourceStream != null ? null : dataStream)
@@ -337,11 +357,11 @@ partial class BackendManager
                     }
                 }
 
-                if (LastModificationUtc.HasValue && backend is ISetTimestampBackend timestampBackend)
+                if (LastModifiedUtc.HasValue && backend is ISetTimestampBackend timestampBackend && backend is not IModificationTimeEnabledBackend)
                 {
                     try
                     {
-                        await timestampBackend.SetLastWriteTimeUtcAsync(effectiveName, LastModificationUtc.Value, cancelToken).ConfigureAwait(false);
+                        await timestampBackend.SetLastWriteTimeUtcAsync(effectiveName, LastModifiedUtc.Value, cancelToken).ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {
@@ -461,13 +481,30 @@ partial class BackendManager
         /// Renames the remote target file after an error, and updates the index file, if any
         /// </summary>
         /// <param name="Size">The size of the file</param>
-        private void RenameFileAfterError(long Size)
+        /// <param name="cancelToken">The cancellation token</param>
+        private async Task RenameFileAfterErrorAsync(long Size, CancellationToken cancelToken)
         {
             var p = VolumeBase.ParseFilename(RemoteFilename);
             var guid = VolumeWriterBase.GenerateGuid();
             var time = p.Time.Ticks == 0 ? p.Time : p.Time.AddSeconds(1);
             var newname = VolumeBase.GenerateFilename(p.FileType, p.Prefix, guid, time, p.CompressionModule, p.EncryptionModule);
             var oldname = RemoteFilename;
+
+            // A dlist name has no random part, so the next second can be the name of another
+            // dlist file. Uploading under it would replace that file, and renaming the volume
+            // to it would rename the other volume's entry.
+            if (IsRemoteNameTaken != null)
+            {
+                var tries = 1;
+                while (await IsRemoteNameTaken(newname, cancelToken).ConfigureAwait(false))
+                {
+                    if (++tries > MaxRenameTries)
+                        throw new UserInformationException($"Failed to find an unused filename to retry the upload of {oldname}, tried {MaxRenameTries} names from {VolumeBase.GenerateFilename(p.FileType, p.Prefix, guid, p.Time.AddSeconds(1), p.CompressionModule, p.EncryptionModule)}", "FailedToFindUnusedFilename");
+
+                    time = time.AddSeconds(1);
+                    newname = VolumeBase.GenerateFilename(p.FileType, p.Prefix, guid, time, p.CompressionModule, p.EncryptionModule);
+                }
+            }
 
             Context.Statwriter.SendEvent(BackendActionType.Put, BackendEventType.Rename, oldname, Size);
             Context.Statwriter.SendEvent(BackendActionType.Put, BackendEventType.Rename, newname, Size);

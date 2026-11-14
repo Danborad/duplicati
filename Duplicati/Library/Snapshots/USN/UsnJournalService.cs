@@ -65,11 +65,15 @@ namespace Duplicati.Library.Snapshots.USN
         /// <param name="skipFilesLargerThan"></param>
         /// <param name="prevJournalData">Journal-data of previous fileset</param>
         /// <param name="token"></param>
+        /// <param name="extraConfiguration">Further settings that decide which files are backed up. The journal
+        /// is only used when they are the same as for the previous fileset. Nothing is added when this is empty,
+        /// so the configuration of a backup without them is the same as before.</param>
         public UsnJournalService(ISnapshotService snapshot, IFilter emitFilter, FileAttributes fileAttributeFilter,
-            long skipFilesLargerThan, IEnumerable<USNJournalDataEntry> prevJournalData, CancellationToken token)
+            long skipFilesLargerThan, IEnumerable<USNJournalDataEntry> prevJournalData, CancellationToken token,
+            IEnumerable<string>? extraConfiguration = null)
         {
             m_snapshot = snapshot;
-            m_volumeDataDict = Initialize(emitFilter, fileAttributeFilter, skipFilesLargerThan, prevJournalData);
+            m_volumeDataDict = Initialize(emitFilter, fileAttributeFilter, skipFilesLargerThan, prevJournalData, extraConfiguration);
             m_token = token;
         }
 
@@ -85,9 +89,10 @@ namespace Duplicati.Library.Snapshots.USN
         /// <param name="fileAttributeFilter"></param>
         /// <param name="skipFilesLargerThan"></param>
         /// <param name="prevJournalData"></param>
+        /// <param name="extraConfiguration"></param>
         /// <returns></returns>
         private Dictionary<string, VolumeData> Initialize(IFilter emitFilter, FileAttributes fileAttributeFilter, long skipFilesLargerThan,
-            IEnumerable<USNJournalDataEntry> prevJournalData)
+            IEnumerable<USNJournalDataEntry> prevJournalData, IEnumerable<string>? extraConfiguration)
         {
             if (prevJournalData == null)
                 throw new UsnJournalSoftFailureException(Strings.USNHelper.PreviousBackupNoInfo);
@@ -100,7 +105,7 @@ namespace Duplicati.Library.Snapshots.USN
                 string.Join("; ", m_snapshot.SourceEntries),
                 fileAttributeFilter.ToString(),
                 skipFilesLargerThan.ToString()
-            }));
+            }.Concat(extraConfiguration ?? []).ToArray()));
 
             // create lookup for journal data
             var journalDataDict = prevJournalData.ToDictionary(data => data.Volume);
@@ -255,21 +260,35 @@ namespace Duplicati.Library.Snapshots.USN
 
                 if (volumeData.Files != null)
                 {
-                    foreach (var filePath in volumeData.Files)
+                    // The folder of a source file is recorded too, as in a scan without the journal (#6863)
+                    foreach (var entry in ParentFolderSourceEntry.WithFoldersOfFileSources(m_snapshot, GetSourceFiles(volumeData.Files)))
                     {
                         if (token.IsCancellationRequested)
                             yield break;
 
-                        var file = m_snapshot.GetFilesystemEntry(filePath, false);
-                        if (file != null)
-                            yield return file;
-                        else
-                            Logging.Log.WriteWarningMessage(FILTER_LOGTAG, "FolderLookupError", null, "No entry while locating source file {0}", filePath);
+                        yield return entry;
                     }
                 }
             }
         }
 
+
+        /// <summary>
+        /// Returns the entries of the given source files, and logs the ones that cannot be found
+        /// </summary>
+        /// <param name="filePaths">The paths of the source files</param>
+        /// <returns>The entries of the source files</returns>
+        private IEnumerable<ISourceProviderEntry> GetSourceFiles(IEnumerable<string> filePaths)
+        {
+            foreach (var filePath in filePaths)
+            {
+                var file = m_snapshot.GetFilesystemEntry(filePath, false);
+                if (file != null)
+                    yield return file;
+                else
+                    Logging.Log.WriteWarningMessage(FILTER_LOGTAG, "FolderLookupError", null, "No entry while locating source file {0}", filePath);
+            }
+        }
 
         /// <summary>
         /// Filters sources, returning sub-set having been modified since last

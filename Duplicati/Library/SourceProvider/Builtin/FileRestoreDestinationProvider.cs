@@ -101,7 +101,7 @@ public class FileRestoreDestinationProvider(string mountedPath, bool allowRestor
         => Task.CompletedTask;
 
     /// <inheritdoc />
-    public Task Finalize(Action<double>? progressCallback, CancellationToken cancel)
+    public Task Finalize(Action<double>? progressCallback, bool isComplete, CancellationToken cancel)
         => Task.CompletedTask;
 
     /// <inheritdoc />
@@ -156,7 +156,8 @@ public class FileRestoreDestinationProvider(string mountedPath, bool allowRestor
         {
             if (!allowRestoreOutsideTargetDirectory && !string.IsNullOrWhiteSpace(TargetDestination))
             {
-                var fullPath = Path.GetFullPath(path);
+                // A folder link's path ends in a separator, which would make the link its own parent
+                var fullPath = Path.GetFullPath(targetpath);
                 var parent = Path.GetDirectoryName(fullPath);
                 if (!string.IsNullOrEmpty(parent))
                 {
@@ -231,9 +232,21 @@ public class FileRestoreDestinationProvider(string mountedPath, bool allowRestor
         else if (isDirTarget && !SystemIO.IO_OS.DirectoryExists(targetpath))
             SystemIO.IO_OS.DirectoryCreate(targetpath);
 
-        // Avoid setting restoring symlink metadata, as that writes the symlink target, not the symlink itself
+        // Do not apply metadata to symlinks unless --restore-symlink-metadata is set. What is applied is set on
+        // the link itself; outside Windows the permissions and the file attributes of a link are skipped,
+        // as chmod would change the file or folder the link points to
         if (!restoreSymlinkMetadata && SystemIO.IO_OS.IsSymlink(targetpath))
         {
+            // The owner is set with lchown, which does not follow the link, so it is restored with the permissions alone
+            if (restorePermissions && !OperatingSystem.IsWindows())
+            {
+                var owner = metadata
+                    .Where(x => x.Value != null && (x.Key == "unix:uid-gid-perm" || x.Key == "unix:owner-name" || x.Key == "unix:group-name"))
+                    .ToDictionary(x => x.Key, x => x.Value!);
+                if (owner.Count > 0)
+                    SystemIO.IO_OS.SetMetadata(path, owner, restorePermissions);
+            }
+
             Logging.Log.WriteVerboseMessage(LOGTAG, "no-symlink-metadata-restored", "Not applying metadata to symlink: {0}", targetpath);
             return Task.FromResult(wrote_something);
         }

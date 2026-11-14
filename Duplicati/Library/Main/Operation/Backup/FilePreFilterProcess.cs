@@ -64,6 +64,9 @@ namespace Duplicati.Library.Main.Operation.Backup
                 if (SKIPFILESLARGERTHAN == long.MaxValue)
                     SKIPFILESLARGERTHAN = 0;
 
+                var SKIPFILESMODIFIEDBEFORE = options.SkipFilesModifiedBefore;
+                var SKIPFILESMODIFIEDAFTER = options.SkipFilesModifiedAfter;
+
                 var DISABLEFILETIMECHECK = options.DisableFiletimeCheck;
                 var CHECKFILETIMEONLY = options.CheckFiletimeOnly;
                 var SKIPMETADATA = options.SkipMetadata;
@@ -100,6 +103,17 @@ namespace Duplicati.Library.Main.Operation.Backup
                         continue;
                     }
 
+                    // A file without a modification time is kept, as it cannot be told apart
+                    var skippedByTime = e.LastWrite.Ticks != 0
+                        && ((SKIPFILESMODIFIEDBEFORE.HasValue && e.LastWrite < SKIPFILESMODIFIEDBEFORE.Value)
+                            || (SKIPFILESMODIFIEDAFTER.HasValue && e.LastWrite > SKIPFILESMODIFIEDAFTER.Value));
+                    if (skippedByTime)
+                    {
+                        Logging.Log.WriteVerboseMessage(FILELOGTAG, "SkipCheckModifiedTime", "Skipped checking file, because its modification time is outside the limits {0}", e.Entry.Path);
+                        await self.ProgressChannel.WriteAsync(new ProgressEvent() { Filepath = e.Entry.Path, Length = filestatsize, Type = EventType.FileSkipped });
+                        continue;
+                    }
+
                     // Invalid ID indicates a new file
                     var isNewFile = e.OldId < 0;
 
@@ -120,6 +134,7 @@ namespace Duplicati.Library.Main.Operation.Backup
                         {
                             if (ex.IsRetiredException())
                                 throw;
+                            FailedPathRecorder.Record(e.Entry.Path);
                             Logging.Log.WriteWarningMessage(FILELOGTAG, "FailedToAddFile", ex, "Failed while attempting to add unmodified file to database: {0}", e.Entry.Path);
                         }
                         await self.ProgressChannel.WriteAsync(new ProgressEvent() { Filepath = e.Entry.Path, Length = filestatsize, Type = EventType.FileSkipped });
@@ -158,6 +173,7 @@ namespace Duplicati.Library.Main.Operation.Backup
                         }
                         catch (Exception ex)
                         {
+                            FailedPathRecorder.Record(e.Entry.Path);
                             Logging.Log.WriteWarningMessage(FILELOGTAG, "FailedToAddFile", ex, "Failed while attempting to add unmodified file to database: {0}", e.Entry.Path);
                         }
                         await self.ProgressChannel.WriteAsync(new ProgressEvent() { Filepath = e.Entry.Path, Length = filestatsize, Type = EventType.FileSkipped });

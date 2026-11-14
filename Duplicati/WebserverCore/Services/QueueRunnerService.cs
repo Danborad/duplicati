@@ -19,6 +19,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
 // DEALINGS IN THE SOFTWARE.
 
+using Duplicati.Library.ChangeTracking;
 using Duplicati.Library.Interface;
 using Duplicati.Library.RestAPI;
 using Duplicati.Library.Utility;
@@ -38,8 +39,13 @@ public class QueueRunnerService(
     INotificationUpdateService notificationUpdateService,
     IProgressStateProviderService progressStateProviderService,
     IApplicationSettings applicationSettings,
-    IDatabaseLockTracker databaseLockTracker) : IQueueRunnerService, IDisposable
+    IDatabaseLockTracker databaseLockTracker,
+    IChangeTrackingService changeTracking) : IQueueRunnerService, IDisposable
 {
+    /// <summary>
+    /// The tag used for logging
+    /// </summary>
+    private static readonly string LOGTAG = Library.Logging.Log.LogTagFromType<QueueRunnerService>();
     private readonly object _lock = new();
     /// <summary>
     /// A thread-safe dictionary to store cached task results.
@@ -50,6 +56,11 @@ public class QueueRunnerService(
     /// The maximum number of completed task results to keep in memory
     /// </summary>
     private static readonly int MAX_TASK_RESULT_CACHE_SIZE = 100;
+
+    /// <summary>
+    /// One turn per database for the tasks that run immediately, so they wait for each other
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _immediateTurns = new(Library.Utility.Utility.ClientFilenameStringComparer);
 
     private readonly List<IQueuedTask> _tasks = new();
     private (Task? Task, IQueuedTask? QueuedTask, CancellationTokenSource? LockCts) _current;
@@ -152,13 +163,20 @@ public class QueueRunnerService(
 
             dbLock = await AcquireDatabaseLockAsync(task, lockCts.Token).ConfigureAwait(false);
 
-            var result = await Runner.RunAsync(connection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, task, true).ConfigureAwait(false);
+            var result = await Runner.RunAsync(connection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, changeTracking, task, true).ConfigureAwait(false);
 
             // If the task is completed, don't call OnFinished again
             completed = true;
             AddTaskResult(new CachedTaskResult(task.TaskID, task.BackupID, task.TaskStarted, task.TaskFinished ?? DateTime.Now, null, GetResultErrorMessage(result)));
             if (task.OnFinished != null)
                 await task.OnFinished(null).ConfigureAwait(false);
+        }
+        catch (Scheduler.RunNoLongerScheduledException ex)
+        {
+            // The run was skipped before it started, which is not an error
+            Library.Logging.Log.WriteInformationMessage(LOGTAG, "ScheduledRunSkipped", ex.Message);
+            completed = true;
+            AddTaskResult(new CachedTaskResult(task.TaskID, task.BackupID, task.TaskStarted, DateTime.UtcNow, null));
         }
         catch (Exception ex)
         {
@@ -251,21 +269,35 @@ public class QueueRunnerService(
     public async Task<IBasicResults?> RunImmediatelyAsync(IQueuedTask task)
     {
         IAsyncDisposable? dbLock = null;
+        SemaphoreSlim? turn = null;
         var dbPath = Runner.GetEffectiveDBPath(task);
 
         // If we have a database to work with, make sure we can get the lock
         if (!string.IsNullOrWhiteSpace(dbPath))
-            dbLock = databaseLockTracker.TryAcquire(dbPath)
-                ?? throw new DatabaseLockedException(dbPath);
+        {
+            // Tasks that run immediately, such as the listings of the restore tree, are short, and the UI
+            // can start several at once. They take turns, so they do not fail on each other's lock.
+            // A queued task, such as a backup, can hold the lock for a long time, so that still fails at once.
+            turn = _immediateTurns.GetOrAdd(Path.GetFullPath(dbPath), _ => new SemaphoreSlim(1, 1));
+            await turn.WaitAsync(_terminateCts.Token).ConfigureAwait(false);
+
+            dbLock = databaseLockTracker.TryAcquire(dbPath);
+            if (dbLock == null)
+            {
+                turn.Release();
+                throw new DatabaseLockedException(dbPath);
+            }
+        }
 
         try
         {
-            return await Runner.RunAsync(connection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, task, false).ConfigureAwait(false);
+            return await Runner.RunAsync(connection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, changeTracking, task, false).ConfigureAwait(false);
         }
         finally
         {
             if (dbLock != null)
                 await dbLock.DisposeAsync().ConfigureAwait(false);
+            turn?.Release();
         }
     }
 

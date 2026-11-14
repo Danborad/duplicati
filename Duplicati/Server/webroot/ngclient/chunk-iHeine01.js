@@ -1,0 +1,1 @@
+import{a as m}from"./main-YFM5JEC3.js";import"./chunk-C8hUYtWT.js";import"./chunk-D1i-k_bf.js";export{m as RelativeTimePipe};

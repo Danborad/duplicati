@@ -1787,6 +1787,41 @@ namespace Duplicati.Library.Utility
         }
 
         /// <summary>
+        /// Computes the delay before the next retry of an operation, as <see cref="GetRetryDelay(TimeSpan, int, bool)"/>,
+        /// but waits at least as long as the server asked for if the attempt failed because of a rate limit
+        /// that carried a Retry-After value
+        /// </summary>
+        /// <param name="retryDelay">Value of one delay unit</param>
+        /// <param name="retryAttempt">The attempt number (e.g. 1 for the first retry, 2 for the second retry, etc.)</param>
+        /// <param name="useExponentialBackoff">Whether to use exponential backoff</param>
+        /// <param name="failure">The exception the attempt failed with</param>
+        /// <param name="now">The current time, used for a Retry-After date</param>
+        /// <returns>The computed delay</returns>
+        public static TimeSpan GetRetryDelay(TimeSpan retryDelay, int retryAttempt, bool useExponentialBackoff, Exception failure, DateTimeOffset now)
+        {
+            var delay = GetRetryDelay(retryDelay, retryAttempt, useExponentialBackoff);
+            var retryAfter = GetRetryAfterDelay(ExceptionExtensions.FindRateLimit(failure)?.RetryAfter, now);
+            return retryAfter > delay ? retryAfter.Value : delay;
+        }
+
+        /// <summary>
+        /// Gets the time left until a request may be sent again, as given by a Retry-After value
+        /// </summary>
+        /// <param name="retryAfter">The Retry-After value, if any</param>
+        /// <param name="now">The current time, used for a Retry-After date</param>
+        /// <returns>The delay, never negative, or <c>null</c> if no usable value was given</returns>
+        public static TimeSpan? GetRetryAfterDelay(System.Net.Http.Headers.RetryConditionHeaderValue? retryAfter, DateTimeOffset now)
+        {
+            var delay = retryAfter?.Delta
+                ?? (retryAfter?.Date is DateTimeOffset date ? date - now : null);
+
+            if (delay == null)
+                return null;
+
+            return delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
+        }
+
+        /// <summary>
         /// Loads the pfxcertificate from bytes into an exportable format.
         /// </summary>
         /// <remarks>This method masks a problem with loading certificates with EC based keys by using a temporary file</remarks>
@@ -1862,6 +1897,16 @@ namespace Duplicati.Library.Utility
         }
 
         /// <summary>
+        /// The S3 backend option holding the server hostname (or a URL with it).
+        /// </summary>
+        private const string S3_SERVER_NAME_OPTION = "s3-server-name";
+
+        /// <summary>
+        /// The server the S3 backend uses when no server name is given.
+        /// </summary>
+        private const string DEFAULT_S3_HOST = "s3.amazonaws.com";
+
+        /// <summary>
         /// Regex used to extract the host from a URL.
         /// </summary>
         private static readonly Regex hostSuffixRegex = new Regex(@"^(?:[a-zA-Z][a-zA-Z0-9+\-.]*://)?([^/:]+)", RegexOptions.Compiled);
@@ -1914,6 +1959,18 @@ namespace Duplicati.Library.Utility
             ".srvstorage.kz",
             ".relaix.net",
             ".neon.tech",
+            ".oraclecloud.com",
+            ".customer-oci.com",
+            ".cloud-object-storage.appdomain.cloud",
+            ".your-objectstorage.com",
+            ".cloud.ovh.net",
+            ".ionoscloud.com",
+            ".exo.io",
+            ".synologyc2.net",
+            ".myhuaweicloud.com",
+            ".myhuaweicloud.eu",
+            ".myqcloud.com",
+            ".dosya.dev",
         ], StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
@@ -1936,7 +1993,15 @@ namespace Duplicati.Library.Utility
 
             try
             {
-                var hostname = hostSuffixRegex.Match(url).Groups[1].Value;
+                // The host part of an S3 url is the bucket; the server is in the s3-server-name option
+                var queryIndex = url.IndexOf('?');
+                var query = queryIndex < 0 ? "" : url[(queryIndex + 1)..];
+                var serverName = UrlEncoding.ParseQueryString(query, true)[S3_SERVER_NAME_OPTION]?.Trim();
+
+                // Without a server name, the S3 backend connects to Amazon
+                var hostname = string.IsNullOrEmpty(serverName)
+                    ? DEFAULT_S3_HOST
+                    : hostSuffixRegex.Match(serverName).Groups[1].Value;
                 if (string.IsNullOrEmpty(hostname))
                     return null;
 
@@ -2082,7 +2147,9 @@ namespace Duplicati.Library.Utility
             cts.CancelAfter(timeout);
             try
             {
-                await func(cts.Token);
+                // Stop waiting when the timeout passes, also for a call that ignores the token;
+                // such a call keeps running, and the caller must not reuse what it is using
+                await func(cts.Token).WaitAsync(cts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
             {
@@ -2106,7 +2173,9 @@ namespace Duplicati.Library.Utility
             cts.CancelAfter(timeout);
             try
             {
-                return await func(cts.Token);
+                // Stop waiting when the timeout passes, also for a call that ignores the token;
+                // such a call keeps running, and the caller must not reuse what it is using
+                return await func(cts.Token).WaitAsync(cts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
             {
@@ -2178,44 +2247,80 @@ namespace Duplicati.Library.Utility
         }
 
         /// <summary>
-        /// Wraps the stream in a timeout observing stream
+        /// Wraps the stream in a timeout observing stream that counts both the time inside each read and the time between reads
         /// </summary>
         /// <param name="stream">The stream to wrap</param>
         /// <param name="timeout">The timeout to observe</param>
         /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
         /// <returns>The wrapped stream</returns>
         public static Stream ObserveReadTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream = true)
+            => ObserveReadTimeout(stream, timeout, disposeBaseStream, TimeoutMode.CallAndGap);
+
+        /// <summary>
+        /// Wraps the stream in a timeout observing stream.
+        /// Use <see cref="TimeoutMode.Call"/> when the wrapped stream is the remote side, such as a network response stream that this code reads,
+        /// and <see cref="TimeoutMode.Gap"/> when the stream is handed to a library that does the transfer,
+        /// so that time spent waiting on this side of the transfer does not count against the timeout.
+        /// </summary>
+        /// <param name="stream">The stream to wrap</param>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
+        /// <param name="mode">The time that counts against the timeout</param>
+        /// <returns>The wrapped stream</returns>
+        public static Stream ObserveReadTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream, TimeoutMode mode)
         {
             if (stream == null)
                 throw new ArgumentNullException(nameof(stream));
 
             return new TimeoutObservingStream(stream, disposeBaseStream)
             {
-                ReadTimeout = timeout.Ticks > 0 && timeout != Timeout.InfiniteTimeSpan
-                    ? (int)timeout.TotalMilliseconds
-                    : Timeout.Infinite
+                Mode = mode,
+                ReadTimeout = ToTimeoutMilliseconds(timeout)
             };
         }
 
         /// <summary>
-        /// Wraps the stream in a timeout observing stream
+        /// Wraps the stream in a timeout observing stream that counts both the time inside each write and the time between writes
         /// </summary>
         /// <param name="stream">The stream to wrap</param>
         /// <param name="timeout">The timeout to observe</param>
         /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
         /// <returns>The wrapped stream</returns>
         public static Stream ObserveWriteTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream = true)
+            => ObserveWriteTimeout(stream, timeout, disposeBaseStream, TimeoutMode.CallAndGap);
+
+        /// <summary>
+        /// Wraps the stream in a timeout observing stream.
+        /// Use <see cref="TimeoutMode.Call"/> when the wrapped stream is the remote side, such as a network stream that this code writes to,
+        /// and <see cref="TimeoutMode.Gap"/> when the stream is handed to a library that does the transfer, or is a destination that may block
+        /// while the rest of the pipeline catches up, so that time spent waiting on this side of the transfer does not count against the timeout.
+        /// </summary>
+        /// <param name="stream">The stream to wrap</param>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
+        /// <param name="mode">The time that counts against the timeout</param>
+        /// <returns>The wrapped stream</returns>
+        public static Stream ObserveWriteTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream, TimeoutMode mode)
         {
             if (stream == null)
                 throw new ArgumentNullException(nameof(stream));
 
             return new TimeoutObservingStream(stream, disposeBaseStream)
             {
-                WriteTimeout = timeout.Ticks > 0 && timeout != Timeout.InfiniteTimeSpan
-                    ? (int)timeout.TotalMilliseconds
-                    : Timeout.Infinite
+                Mode = mode,
+                WriteTimeout = ToTimeoutMilliseconds(timeout)
             };
         }
+
+        /// <summary>
+        /// Converts a timeout to the milliseconds used by a stream timeout, where zero or less and infinite both mean no timeout
+        /// </summary>
+        /// <param name="timeout">The timeout to convert</param>
+        /// <returns>The timeout in milliseconds, or <see cref="Timeout.Infinite"/></returns>
+        private static int ToTimeoutMilliseconds(TimeSpan timeout)
+            => timeout.Ticks > 0 && timeout != Timeout.InfiniteTimeSpan
+                ? (int)timeout.TotalMilliseconds
+                : Timeout.Infinite;
 
         /// <summary>
         /// The types of streams that are considered basic (i.e. not wrapped)

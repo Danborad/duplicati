@@ -68,6 +68,16 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
     private bool _disposed;
 
     /// <summary>
+    /// Set when an operation timed out or was cancelled and the client was disconnected to end it
+    /// </summary>
+    private volatile bool _broken;
+
+    /// <summary>
+    /// True when the connection was closed after an operation on it timed out, and must be replaced
+    /// </summary>
+    public bool IsBroken => _broken;
+
+    /// <summary>
     /// This constructor will connect to the server and share as specified in the connection parameters.
     /// 
     /// It throws specific exceptions for connection and authentication failures.
@@ -98,6 +108,62 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Runs a call with a timeout, and disconnects the client if the call is given up on.
+    /// The call may still be waiting for the server on another thread, and the client allows only
+    /// one request at a time; closing the socket makes that call return and the client unusable.
+    /// </summary>
+    /// <param name="client">The client the call uses</param>
+    /// <param name="timeout">The timeout to observe</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <param name="func">The call</param>
+    /// <returns>The result of the call</returns>
+    private static async Task<T> WithTimeoutAsync<T>(SMB2Client client, TimeSpan timeout, CancellationToken cancellationToken, Func<CancellationToken, T> func)
+    {
+        try
+        {
+            return await Utility.Utility.WithTimeout(timeout, cancellationToken, func).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            try { client.Disconnect(); }
+            catch { }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Runs a call on this connection with a timeout, and marks the connection as broken if the call is given up on
+    /// </summary>
+    /// <param name="timeout">The timeout to observe</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <param name="func">The call</param>
+    /// <returns>The result of the call</returns>
+    private async Task<T> RunAsync<T>(TimeSpan timeout, CancellationToken cancellationToken, Func<CancellationToken, T> func)
+    {
+        if (_broken)
+            throw new UserInformationException(LC.L("The connection to the server was closed after an operation timed out"), "ConnectionClosed");
+
+        try
+        {
+            return await WithTimeoutAsync(_smb2Client, timeout, cancellationToken, func).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            _broken = true;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Runs a call on this connection with a timeout, and marks the connection as broken if the call is given up on
+    /// </summary>
+    /// <param name="timeout">The timeout to observe</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <param name="func">The call</param>
+    private Task RunAsync(TimeSpan timeout, CancellationToken cancellationToken, Action<CancellationToken> func)
+        => RunAsync(timeout, cancellationToken, ct => { func(ct); return true; });
+
+    /// <summary>
     /// Creates a new SMBShareConnection object asynchronously.
     /// </summary>
     /// <param name="connectionParameters">The connection parameters</param>
@@ -108,21 +174,21 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
     public static async Task<SMBShareConnection> CreateAsync(SMBConnectionParameters connectionParameters, TimeoutOptionsHelper.Timeouts timeouts, CancellationToken cancellationToken)
     {
         var client = new SMB2Client(GetResponseTimeoutInMilliseconds(timeouts.ReadWriteTimeout), connectionParameters.EnableSMB311Support);
-        var connected = await Utility.Utility.WithTimeout(timeouts.ShortTimeout, cancellationToken, _ =>
+        var connected = await WithTimeoutAsync(client, timeouts.ShortTimeout, cancellationToken, _ =>
             client.Connect(connectionParameters.ServerName, connectionParameters.TransportType)
         ).ConfigureAwait(false);
 
         if (!connected)
             throw new UserInformationException($"{LC.L("Failed to connect to server")} {connectionParameters.ServerName}", "ConnectionError");
 
-        var status = await Utility.Utility.WithTimeout(timeouts.ShortTimeout, cancellationToken, _ =>
+        var status = await WithTimeoutAsync(client, timeouts.ShortTimeout, cancellationToken, _ =>
             client.Login(connectionParameters.AuthDomain ?? "", connectionParameters.AuthUser ?? "", connectionParameters.AuthPassword ?? "")
         ).ConfigureAwait(false);
 
         if (status != NTStatus.STATUS_SUCCESS)
             throw new UserInformationException($"{LC.L("Failed to authenticate to server")} {connectionParameters.ServerName} with status {status}", "ConnectionError");
 
-        (var res, status) = await Utility.Utility.WithTimeout(timeouts.ShortTimeout, cancellationToken, _ =>
+        (var res, status) = await WithTimeoutAsync(client, timeouts.ShortTimeout, cancellationToken, _ =>
             {
                 var res = client.TreeConnect(connectionParameters.ShareName, out status);
                 return (res, status);
@@ -146,7 +212,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
         await _semaphore.WaitAsync(cancellationToken);
         try
         {
-            await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            await RunAsync(_timeouts.ShortTimeout, cancellationToken, _ =>
             {
                 var status = _smbFileStore.CreateFile(out var fileHandle, out var fileStatus, NormalizeSlashes(Path.Combine(_connectionParameters.Path, fileName)),
                     AccessMask.GENERIC_WRITE | AccessMask.DELETE | AccessMask.SYNCHRONIZE,
@@ -196,6 +262,58 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Deletes an empty folder below the path specified in the connection parameters.
+    /// </summary>
+    /// <param name="folderName">The folder to delete, relative to the connection path</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <exception cref="UserInformationException">Exception to be displayed to user</exception>
+    public async Task DeleteDirectoryAsync(string folderName, CancellationToken cancellationToken)
+    {
+        await _semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            {
+                var status = _smbFileStore.CreateFile(out var fileHandle, out var fileStatus, NormalizeSlashes(Path.Combine(_connectionParameters.Path, folderName)),
+                    AccessMask.DELETE | AccessMask.SYNCHRONIZE,
+                    FileAttributes.Directory,
+                    ShareAccess.Read | ShareAccess.Write | ShareAccess.Delete,
+                    CreateDisposition.FILE_OPEN,
+                    CreateOptions.FILE_DIRECTORY_FILE | CreateOptions.FILE_SYNCHRONOUS_IO_ALERT,
+                    null);
+
+                // Already gone, which is the outcome the caller asked for
+                if (status is NTStatus.STATUS_OBJECT_NAME_NOT_FOUND or NTStatus.STATUS_OBJECT_PATH_NOT_FOUND)
+                    return;
+
+                if (status != NTStatus.STATUS_SUCCESS)
+                    throw new UserInformationException($"{LC.L("Failed to open folder on DeleteDirectoryAsync")} {folderName} with status {status}", "DeleteFolderError");
+
+                try
+                {
+                    status = _smbFileStore.SetFileInformation(fileHandle, new FileDispositionInformation { DeletePending = true });
+                    if (status != NTStatus.STATUS_SUCCESS)
+                        throw new UserInformationException($"{LC.L("Failed to delete folder on DeleteDirectoryAsync")} with status {status}", "DeleteFolderError");
+                }
+                catch
+                {
+                    // Release the handle so the folder is not left open on the server
+                    try { _smbFileStore.CloseFile(fileHandle); }
+                    catch { }
+                    throw;
+                }
+                status = _smbFileStore.CloseFile(fileHandle);
+                if (status != NTStatus.STATUS_SUCCESS)
+                    throw new UserInformationException($"{LC.L("Failed to close folder on DeleteDirectoryAsync")} with status {status}", "CloseFileError");
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    /// <summary>
     /// Create the folder structure specified in the path.
     /// </summary>
     /// <param name="path">Path to create</param>
@@ -219,7 +337,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
                 object? fileHandle = null;
                 try
                 {
-                    await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+                    await RunAsync(_timeouts.ShortTimeout, cancellationToken, _ =>
                     {
                         var status = _smbFileStore.CreateFile(
                             out fileHandle,
@@ -270,7 +388,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
         {
             try
             {
-                var fileList = await Utility.Utility.WithTimeout(_timeouts.ListTimeout, cancellationToken, _ =>
+                var fileList = await RunAsync(_timeouts.ListTimeout, cancellationToken, _ =>
                 {
                     var status = _smbFileStore.CreateFile(
                         out directoryHandle,
@@ -329,8 +447,9 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
             }
             catch
             {
-                // Closing can fail for the same reason the listing did, and must not hide that reason
-                if (directoryHandle != null)
+                // Closing can fail for the same reason the listing did, and must not hide that reason.
+                // A broken connection has already been closed, and the handle with it
+                if (directoryHandle != null && !_broken)
                     try { _smbFileStore.CloseFile(directoryHandle); }
                     catch { }
                 throw;
@@ -350,7 +469,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
         FileStatus fileStatus;
         try
         {
-            return await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            return await RunAsync(_timeouts.ShortTimeout, cancellationToken, _ =>
             {
                 var status = _smbFileStore.CreateFile(
                     out fileHandle,
@@ -422,7 +541,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
 
         try
         {
-            (var status, var fileStatus, var fileHandle) = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            (var status, var fileStatus, var fileHandle) = await RunAsync(_timeouts.ShortTimeout, cancellationToken, _ =>
             {
                 var status = _smbFileStore.CreateFile(out var fileHandle, out var fileStatus,
                 NormalizeSlashes(Path.Combine(_connectionParameters.Path, filename)),
@@ -511,7 +630,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
         await _semaphore.WaitAsync(cancellationToken);
         try
         {
-            (var status, var fileStatus, var fileHandle) = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            (var status, var fileStatus, var fileHandle) = await RunAsync(_timeouts.ShortTimeout, cancellationToken, _ =>
             {
                 var status = _smbFileStore.CreateFile(out var fileHandle, out var fileStatus,
                     NormalizeSlashes(Path.Combine(_connectionParameters.Path, filename)),
@@ -609,7 +728,7 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
         await _semaphore.WaitAsync(cancellationToken);
         try
         {
-            await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            await RunAsync(_timeouts.ShortTimeout, cancellationToken, _ =>
             {
                 var status = _smbFileStore.CreateFile(out var fileHandle, out var fileStatus, NormalizeSlashes(Path.Combine(_connectionParameters.Path, oldname)),
                     AccessMask.GENERIC_WRITE | AccessMask.DELETE | AccessMask.SYNCHRONIZE,
@@ -660,6 +779,67 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Creates a hard link: a second name for the content of an existing file, using
+    /// the SMB2 FileLinkInformation set-info request.
+    /// </summary>
+    /// <param name="existingName">The existing file, relative to the connection path</param>
+    /// <param name="targetName">The link to create, relative to the connection path</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <exception cref="HardLinkNotSupportedException">The server or the share's filesystem cannot create hard links</exception>
+    public async Task CreateHardLinkAsync(string existingName, string targetName, CancellationToken cancellationToken)
+    {
+        await _semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, _ =>
+            {
+                var status = _smbFileStore.CreateFile(out var fileHandle, out var fileStatus, NormalizeSlashes(Path.Combine(_connectionParameters.Path, existingName)),
+                    AccessMask.GENERIC_WRITE | AccessMask.SYNCHRONIZE,
+                    FileAttributes.Normal,
+                    ShareAccess.Read | ShareAccess.Write | ShareAccess.Delete,
+                    CreateDisposition.FILE_OPEN,
+                    CreateOptions.FILE_NON_DIRECTORY_FILE | CreateOptions.FILE_SYNCHRONOUS_IO_ALERT,
+                    null);
+
+                if (status == NTStatus.STATUS_OBJECT_NAME_NOT_FOUND)
+                    throw new FileMissingException();
+
+                if (status != NTStatus.STATUS_SUCCESS)
+                    throw new UserInformationException($"{LC.L("Failed to open file on CreateHardLinkAsync")} {existingName} with status {status}", "HardLinkFileError");
+
+                var linkInformation = new FileLinkInformationType2
+                {
+                    ReplaceIfExists = false,
+                    FileName = NormalizeSlashes(Path.Combine(_connectionParameters.Path, targetName))
+                };
+                try
+                {
+                    status = _smbFileStore.SetFileInformation(fileHandle, linkInformation);
+                    // A server or filesystem without hard links answers with one of these
+                    if (status is NTStatus.STATUS_NOT_SUPPORTED or NTStatus.STATUS_INVALID_DEVICE_REQUEST or NTStatus.STATUS_INVALID_INFO_CLASS)
+                        throw new HardLinkNotSupportedException($"{LC.L("The SMB share cannot create hard links")} ({status})");
+                    if (status != NTStatus.STATUS_SUCCESS)
+                        throw new UserInformationException($"{LC.L("Failed to create hard link on CreateHardLinkAsync")} with status {status}", "HardLinkFileError");
+                }
+                catch
+                {
+                    // Release the handle so the file is not left open on the server
+                    try { _smbFileStore.CloseFile(fileHandle); }
+                    catch { }
+                    throw;
+                }
+                status = _smbFileStore.CloseFile(fileHandle);
+                if (status != NTStatus.STATUS_SUCCESS)
+                    throw new UserInformationException($"{LC.L("Failed to close file on CreateHardLinkAsync")} with status {status}", "CloseFileError");
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    /// <summary>
     /// Synchronously dispose the resources.
     /// </summary>
     public void Dispose()
@@ -686,7 +866,9 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
         await _semaphore.WaitAsync(); // Ensure no operations are in progress
         try
         {
-            if (_smbFileStore != null)
+            // A broken connection is already disconnected, and a server that stopped answering
+            // would only make a graceful logoff wait for the full response timeout
+            if (_smbFileStore != null && !_broken)
             {
                 try
                 {
@@ -699,7 +881,8 @@ public class SMBShareConnection : IDisposable, IAsyncDisposable
             {
                 try
                 {
-                    await Task.Run(() => _smb2Client.Logoff());
+                    if (!_broken)
+                        await Task.Run(() => _smb2Client.Logoff());
                     await Task.Run(() => _smb2Client.Disconnect());
                 }
                 catch { /* Can be safely ignored */ }

@@ -21,6 +21,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 using Duplicati.Library.Interface;
@@ -184,6 +185,18 @@ public class ControllerRpcServer : IController, IDisposable
         => Controller.SyncAsync(sourcePaths, filter);
 
     /// <inheritdoc />
+    public Task<IListFilesetResults> ListSyncVersionsAsync()
+        => Controller.ListSyncVersionsAsync();
+
+    /// <inheritdoc />
+    public Task<IListFolderResults> ListSyncFolderAsync(string[] sourcePaths, string[]? folders, long offset, long limit)
+        => Controller.ListSyncFolderAsync(sourcePaths, folders, offset, limit);
+
+    /// <inheritdoc />
+    public Task<IRestoreResults> SyncRestoreAsync(string[] sourcePaths, string[]? paths)
+        => Controller.SyncRestoreAsync(sourcePaths, paths);
+
+    /// <inheritdoc />
     public Task<ITestResults> TestAsync(long samples = 1)
         => Controller.TestAsync(samples);
 
@@ -316,6 +329,22 @@ public class ControllerRpcServer : IController, IDisposable
         if (_controller != null)
             await _controller.SetSecretProviderAsync(secretProvider).ConfigureAwait(false);
     }
+
+    /// <inheritdoc />
+    public async Task SetChangeListProviderAsync(IChangeListProvider? changeListProvider)
+    {
+        if (_controller != null)
+            await _controller.SetChangeListProviderAsync(changeListProvider).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Installs, or removes, a change list provider that asks the host process for
+    /// the change list through the callback channel. Invoked by the proxy, which
+    /// keeps the real provider on its side of the boundary.
+    /// </summary>
+    /// <param name="enabled">True to install the provider, false to remove it</param>
+    public Task EnableChangeListProviderAsync(bool enabled)
+        => SetChangeListProviderAsync(enabled ? new RpcChangeListProvider(_callbacks) : null);
 
     /// <inheritdoc />
     public async Task SetLastCompactAsync(DateTime value)
@@ -468,4 +497,26 @@ public class CallbackMessageSink : IMessageSink, IDisposable
             OperationProgress = null;
         }
     }
+}
+
+/// <summary>
+/// A change list provider that asks the host process for the list through the
+/// callback channel. The real provider stays in the host process.
+/// </summary>
+public class RpcChangeListProvider : IChangeListProvider
+{
+    private readonly IControllerRpcCallbacks _callbacks;
+
+    /// <summary>
+    /// Creates a new change list provider
+    /// </summary>
+    /// <param name="callbacks">The callbacks to the host process</param>
+    public RpcChangeListProvider(IControllerRpcCallbacks callbacks)
+    {
+        _callbacks = callbacks;
+    }
+
+    /// <inheritdoc />
+    public Task<ChangeListHandoff?> DrainChangeListAsync(DateTime referenceTimeUtc, CancellationToken cancellationToken)
+        => _callbacks.OnDrainChangeListAsync(referenceTimeUtc).WaitAsync(cancellationToken);
 }

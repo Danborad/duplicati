@@ -34,13 +34,15 @@ public class LocalFileSource(ISnapshotService snapshotService) : ISourceProvider
 
     /// <inheritdoc />
     public bool NeedsStoredMetadata => false;
+    /// <inheritdoc />
+    public bool NeedsCaseSensitiveFilters => false;
 
     /// <inheritdoc/>
     public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     /// <inheritdoc/>
     public IAsyncEnumerable<ISourceProviderEntry> EnumerateAsync(CancellationToken cancellationToken)
-        => snapshotService.EnumerateFilesystemEntries().ToAsyncEnumerable();
+        => Snapshots.ParentFolderSourceEntry.WithFoldersOfFileSources(snapshotService, snapshotService.EnumerateFilesystemEntries()).ToAsyncEnumerable();
 
     /// <summary>
     /// The snapshot service being used

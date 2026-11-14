@@ -27,6 +27,7 @@ using System.Threading.Tasks;
 using CoCoL;
 using Duplicati.Library.AutoUpdater;
 using Duplicati.Library.Certificates;
+using Duplicati.Library.ChangeTracking;
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Crashlog;
 using Duplicati.Library.Encryption;
@@ -65,6 +66,11 @@ namespace Duplicati.Server
         private const string SETTINGS_ENCRYPTION_KEY_OPTION = "settings-encryption-key";
         /// <summary>The commandline argument name for disabling update check.</summary>
         private const string DISABLE_UPDATE_CHECK_OPTION = "disable-update-check";
+        private const string DISABLE_FILE_WATCHER_OPTION = "disable-file-watcher";
+        private const string FILE_WATCHER_FLUSH_INTERVAL_OPTION = "file-watcher-flush-interval";
+        private const string FILE_WATCHER_HIGH_WATER_OPTION = "file-watcher-high-water";
+        private const string FILE_WATCHER_MAX_CHANGES_OPTION = "file-watcher-max-changes";
+        private const string FILE_WATCHER_GRACE_DELAY_OPTION = "file-watcher-grace-delay";
         /// <summary>The commandline argument name for registering remote control.</summary>
         private const string REGISTER_REMOTE_CONTROL_OPTION = "register-remote-control";
         /// <summary>The commandline argument name for forcing remote control reregistration.</summary>
@@ -87,6 +93,8 @@ namespace Duplicati.Server
         private const string LOG_CONSOLE_OPTION = "log-console";
         /// <summary>The commandline argument name for temp directory.</summary>
         private const string TEMPDIR_OPTION = "tempdir";
+        /// <summary>The commandline argument name for forcing the locale.</summary>
+        public const string FORCE_LOCALE_OPTION = "force-locale";
         /// <summary>The commandline argument name for log retention.</summary>
         private const string LOG_RETENTION_OPTION = "log-retention";
         /// <summary>The commandline argument name for help.</summary>
@@ -100,6 +108,10 @@ namespace Duplicati.Server
         /// The exit code for init password failure
         /// </summary>
         public const int EXITCODE_INITPASSWORD_FAILED = 103;
+        /// <summary>
+        /// The exit code when the server crashed, the same code a crash while starting returns
+        /// </summary>
+        public const int EXITCODE_CRASHED = 100;
 
         /// <summary>
         /// The name used in the secret provider for the database encryption key
@@ -222,6 +234,8 @@ namespace Duplicati.Server
                 SystemContextSettings.DefaultTempPath = commandlineOptions["tempdir"];
             }
 
+            ApplyForcedLocale(commandlineOptions, logMessageToConsole);
+
             SystemContextSettings.StartSession();
 
             ApplyEnvironmentVariables(commandlineOptions);
@@ -251,12 +265,21 @@ namespace Duplicati.Server
 
             var crashed = false;
             var terminated = false;
+            // Set when the webserver stops with an exception after it was started
+            var webserverFailed = false;
             IQueueRunnerService queueRunner = null;
             UpdatePollThread updatePollThread = null;
             EventPollNotify eventPollNotify = null;
             ISchedulerService scheduler = null;
+            IChangeTrackingService changeTracking = null;
             try
             {
+                // Opening the database can create or upgrade it, which a second server must not do
+                // while the first one uses it. The data folder is made first, locked down, as the
+                // instance lock would otherwise create it with the default permissions.
+                DataFolderManager.PrepareSecureDataFolder(applicationSettings.DataFolder, createIfMissing: true);
+                CreateApplicationInstance(applicationSettings.DataFolder, writeToConsoleOnException);
+
                 var connection = GetDatabaseConnection(applicationSettings, commandlineOptions, silentConsole, true);
 
                 if (!connection.ApplicationSettings.FixedInvalidBackupId)
@@ -275,8 +298,6 @@ namespace Duplicati.Server
                 var renewalResult = CheckAndRenewCertificate(connection);
                 if (renewalResult.RenewalFailedReason != null)
                     RegisterRenewalFailedNotification(connection, renewalResult.RenewalFailedReason);
-
-                CreateApplicationInstance(applicationSettings.DataFolder, writeToConsoleOnException);
 
                 applicationSettings.StartOrStopUsageReporter = () => StartOrStopUsageReporter(connection);
                 // Bit messy, but the callback needs the connection, and the connection needs the callback
@@ -304,8 +325,10 @@ namespace Duplicati.Server
                 updatePollThread = DuplicatiWebserver.Provider.GetRequiredService<UpdatePollThread>();
                 eventPollNotify = DuplicatiWebserver.Provider.GetRequiredService<EventPollNotify>();
                 scheduler = DuplicatiWebserver.Provider.GetRequiredService<ISchedulerService>();
+                changeTracking = DuplicatiWebserver.Provider.GetRequiredService<IChangeTrackingService>();
 
                 updatePollThread.Init(Library.Utility.Utility.ParseBoolOption(commandlineOptions, DISABLE_UPDATE_CHECK_OPTION));
+                DuplicatiWebserver.Provider.GetRequiredService<IUpdateInstallService>().CompletePendingInstall();
 
                 SetPurgeTempFilesTimer(connection, commandlineOptions);
                 SetCertificateRenewalTimer(connection);
@@ -354,6 +377,7 @@ namespace Duplicati.Server
                 {
                     if (t.Exception != null)
                     {
+                        webserverFailed = true;
                         Log.WriteWarningMessage(LOGTAG, "ServerCrashed", t.Exception, Strings.Program.ServerCrashed(t.Exception.Message));
                         logMessageToConsole(Strings.Program.ServerStartedSignin(Strings.Program.ServerCrashed(t.Exception.ToString())));
                     }
@@ -391,7 +415,7 @@ namespace Duplicati.Server
                 if (!writeToConsoleOnException) throw;
 
                 Console.WriteLine(Strings.Program.SeriousError(mex.ToString()));
-                return 100;
+                return EXITCODE_CRASHED;
             }
             catch (Exception ex)
             {
@@ -401,7 +425,7 @@ namespace Duplicati.Server
                 if (writeToConsoleOnException)
                 {
                     Console.WriteLine(Strings.Program.SeriousError(ex.ToString()));
-                    return 100;
+                    return EXITCODE_CRASHED;
                 }
                 else
                     throw new Exception(Strings.Program.SeriousError(ex.ToString()), ex);
@@ -416,6 +440,7 @@ namespace Duplicati.Server
                     () => updatePollThread?.Terminate(),
                     () => scheduler?.Terminate(true),
                     () => queueRunner?.Terminate(true),
+                    () => changeTracking?.DisposeAsync().AsTask().Await(),
                     () => ApplicationInstance?.Dispose(),
                     () => PurgeTempFilesTimer?.Dispose(),
                     () => CertificateRenewalTimer?.Dispose(),
@@ -447,7 +472,8 @@ namespace Duplicati.Server
                 }
             }
 
-            return 0;
+            // A host such as the Windows service must be able to tell a crash from a requested exit
+            return webserverFailed ? EXITCODE_CRASHED : 0;
         }
 
         /// <summary>
@@ -471,7 +497,8 @@ namespace Duplicati.Server
                     parsedOptions.TokenLifetimeInMinutes,
                     parsedOptions.SPAPaths,
                     parsedOptions.CorsOrigins,
-                    parsedOptions.PreAuthTokens
+                    parsedOptions.PreAuthTokens,
+                    ParseChangeTrackingSettings(options, applicationSettings)
                 );
 
                 var server = DuplicatiWebserver.CreateWebServer(mappedSettings, connection, logWriteHandler, applicationSettings);
@@ -490,6 +517,49 @@ namespace Duplicati.Server
 
             return server;
         }
+
+        /// <summary>
+        /// Applies the forced locale from the commandline options, if any, to the current thread and all threads created later
+        /// </summary>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <param name="logMessageToConsole">The method used to report problems before logging is configured</param>
+        public static void ApplyForcedLocale(Dictionary<string, string> commandlineOptions, Action<string> logMessageToConsole)
+        {
+            if (!commandlineOptions.TryGetValue(FORCE_LOCALE_OPTION, out var localestring))
+                return;
+
+            try
+            {
+                var culture = string.IsNullOrWhiteSpace(localestring)
+                    ? System.Globalization.CultureInfo.InvariantCulture
+                    : new System.Globalization.CultureInfo(localestring);
+
+                System.Globalization.CultureInfo.DefaultThreadCurrentCulture = culture;
+                System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = culture;
+                System.Globalization.CultureInfo.CurrentCulture = culture;
+                System.Globalization.CultureInfo.CurrentUICulture = culture;
+            }
+            catch (Exception ex)
+            {
+                logMessageToConsole(Strings.Program.FailedForceLocaleError(FORCE_LOCALE_OPTION, localestring, ex.Message));
+            }
+        }
+
+        /// <summary>
+        /// Reads the file watcher settings from the commandline options
+        /// </summary>
+        /// <param name="options">The commandline options</param>
+        /// <param name="applicationSettings">The application settings, for the data folder</param>
+        /// <returns>The settings</returns>
+        private static ChangeTrackingSettings ParseChangeTrackingSettings(IReadOnlyDictionary<string, string> options, IApplicationSettings applicationSettings)
+            => new ChangeTrackingSettings(
+                !Library.Utility.Utility.ParseBoolOption(options, DISABLE_FILE_WATCHER_OPTION),
+                System.IO.Path.Combine(applicationSettings.DataFolder, ChangeTrackingSettings.DATABASE_FILENAME),
+                TempFolder.SystemTempPath,
+                Library.Utility.Utility.ParseTimespanOption(options, FILE_WATCHER_FLUSH_INTERVAL_OPTION, ChangeTrackingSettings.DEFAULT_FLUSH_INTERVAL),
+                Library.Utility.Utility.ParseIntOption(options, FILE_WATCHER_HIGH_WATER_OPTION, ChangeTrackingSettings.DEFAULT_HIGH_WATER_MARK),
+                Library.Utility.Utility.ParseLongOption(options, FILE_WATCHER_MAX_CHANGES_OPTION, ChangeTrackingSettings.DEFAULT_MAX_CHANGES),
+                Library.Utility.Utility.ParseTimespanOption(options, FILE_WATCHER_GRACE_DELAY_OPTION, ChangeTrackingSettings.DEFAULT_GRACE_DELAY));
 
         /// <summary>
         /// Sets up the timer for purging temp files and log data
@@ -644,6 +714,17 @@ namespace Duplicati.Server
         }
 
         /// <summary>
+        /// Clears the JWT config, so a new one is generated when the webserver starts, invalidating all existing tokens
+        /// </summary>
+        /// <param name="connection">The connection to use</param>
+        private static void ResetJwtConfig(Connection connection)
+        {
+            connection.ApplicationSettings.JWTConfig = null;
+            // Clean up stored tokens as they are now invalid
+            connection.ExecuteWithCommand((con) => con.ExecuteNonQuery("DELETE FROM TokenFamily"));
+        }
+
+        /// <summary>
         /// Adjusts the application settings based on commandline options
         /// </summary>
         /// <param name="connection">The connection to use</param>
@@ -653,11 +734,7 @@ namespace Duplicati.Server
         {
             // This clears the JWT config, and a new will be generated, invalidating all existing tokens
             if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_RESET_JWT_CONFIG))
-            {
-                connection.ApplicationSettings.JWTConfig = null;
-                // Clean up stored tokens as they are now invalid
-                connection.ExecuteWithCommand((con) => con.ExecuteNonQuery("DELETE FROM TokenFamily"));
-            }
+                ResetJwtConfig(connection);
 
             if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOREVER_TOKEN))
                 connection.ApplicationSettings.EnableForeverTokens();
@@ -683,7 +760,14 @@ namespace Duplicati.Server
                 connection.ApplicationSettings.EnableFolderStatusService = Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOLDER_STATUS_SERVICE);
 
             if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_PASSWORD))
-                connection.ApplicationSettings.SetWebserverPassword(commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_PASSWORD]);
+            {
+                var password = commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_PASSWORD];
+                // Only invalidate tokens if the password differs, so passing the same password on every start keeps sessions alive
+                var passwordChanged = !connection.ApplicationSettings.VerifyWebserverPassword(password);
+                connection.ApplicationSettings.SetWebserverPassword(password);
+                if (passwordChanged)
+                    ResetJwtConfig(connection);
+            }
 
             var initPassword = commandlineOptions.GetValueOrDefault(WebServerLoader.OPTION_WEBSERVICE_PASSWORD_INIT);
             if (!string.IsNullOrWhiteSpace(initPassword))
@@ -692,6 +776,7 @@ namespace Duplicati.Server
                 if (connection.ApplicationSettings.AutogeneratedPassphrase)
                 {
                     connection.ApplicationSettings.SetWebserverPassword(initPassword);
+                    ResetJwtConfig(connection);
                     return EXITCODE_INITPASSWORD_SUCCESS;
                 }
                 else
@@ -1580,6 +1665,7 @@ namespace Duplicati.Server
         [
             .. WindowsOptions,
             new CommandLineArgument(TEMPDIR_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.TempdirShort, Strings.Program.TempdirLong, System.IO.Path.GetTempPath()),
+            new CommandLineArgument(FORCE_LOCALE_OPTION, CommandLineArgument.ArgumentType.String, Strings.Program.ForcelocaleShort, Strings.Program.ForcelocaleLong),
             new CommandLineArgument(HELP_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.HelpCommandDescription, Strings.Program.HelpCommandDescription),
             new CommandLineArgument(PARAMETERS_FILE_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.ParametersFileOptionShort, Strings.Program.ParametersFileOptionLong, "", PARAMETERS_FILE_OPTION_EXTRAS),
             new CommandLineArgument(DataFolderManager.PORTABLE_MODE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.PortablemodeCommandDescription, Strings.Program.PortablemodeCommandDescription, DataFolderManager.PORTABLE_MODE.ToString().ToLowerInvariant()),
@@ -1614,6 +1700,11 @@ namespace Duplicati.Server
             new CommandLineArgument(WebServerLoader.OPTION_SUPPRESS_WELCOME_PAGE, CommandLineArgument.ArgumentType.Boolean, Strings.Program.SuppressWelcomePageShort, Strings.Program.SuppressWelcomePageLong),
             new CommandLineArgument(PING_PONG_KEEPALIVE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.PingpongkeepaliveShort, Strings.Program.PingpongkeepaliveLong),
             new CommandLineArgument(DISABLE_UPDATE_CHECK_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.DisableupdatecheckShort, Strings.Program.DisableupdatecheckLong),
+            new CommandLineArgument(DISABLE_FILE_WATCHER_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.DisablefilewatcherShort, Strings.Program.DisablefilewatcherLong, "false"),
+            new CommandLineArgument(FILE_WATCHER_FLUSH_INTERVAL_OPTION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.FilewatcherflushintervalShort, Strings.Program.FilewatcherflushintervalLong, ChangeTrackingSettings.DEFAULT_FLUSH_INTERVAL),
+            new CommandLineArgument(FILE_WATCHER_HIGH_WATER_OPTION, CommandLineArgument.ArgumentType.Integer, Strings.Program.FilewatcherhighwaterShort, Strings.Program.FilewatcherhighwaterLong, ChangeTrackingSettings.DEFAULT_HIGH_WATER_MARK.ToString()),
+            new CommandLineArgument(FILE_WATCHER_MAX_CHANGES_OPTION, CommandLineArgument.ArgumentType.Integer, Strings.Program.FilewatchermaxchangesShort, Strings.Program.FilewatchermaxchangesLong, ChangeTrackingSettings.DEFAULT_MAX_CHANGES.ToString()),
+            new CommandLineArgument(FILE_WATCHER_GRACE_DELAY_OPTION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.FilewatchergracedelayShort, Strings.Program.FilewatchergracedelayLong, ChangeTrackingSettings.DEFAULT_GRACE_DELAY),
             new CommandLineArgument(LOG_RETENTION_OPTION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.LogretentionShort, Strings.Program.LogretentionLong, DEFAULT_LOG_RETENTION),
             new CommandLineArgument(DataFolderManager.SERVER_DATAFOLDER_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.ServerdatafolderShort, Strings.Program.ServerdatafolderLong(DataFolderManager.DATAFOLDER_ENV_NAME), DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly)),
             new CommandLineArgument(DataFolderManager.ALLOW_INSECURE_DATAFOLDER_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.AllowInsecureDatafolderShort, Strings.Program.AllowInsecureDatafolderLong, false.ToString()),

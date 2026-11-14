@@ -29,6 +29,41 @@ namespace Duplicati.Library.AutoUpdater
     public static class PackageHelper
     {
         /// <summary>
+        /// The environment variable a parent process sets on a child it starts,
+        /// so the child reports the top-level executable the user started
+        /// instead of its own entry assembly
+        /// </summary>
+        public const string ENTRY_ASSEMBLY_ENV_NAME = "DUPLICATI_ENTRY_ASSEMBLY";
+
+        /// <summary>
+        /// The lazily resolved entry assembly name of the top-level executable
+        /// </summary>
+        private static readonly Lazy<string> _entryAssemblyName = new Lazy<string>(ResolveEntryAssemblyName);
+
+        /// <summary>
+        /// The entry assembly name of the top-level executable the user started, such as
+        /// <c>Duplicati.CommandLine</c>, <c>Duplicati.GUI.TrayIcon</c>, <c>Duplicati.Server</c>,
+        /// <c>Duplicati.Service</c>, <c>Duplicati.WindowsService</c> or <c>Duplicati.Agent</c>.
+        /// A process started by another Duplicati process reports the executable of its parent,
+        /// passed via <see cref="ENTRY_ASSEMBLY_ENV_NAME"/>.
+        /// </summary>
+        public static string EntryAssemblyName => _entryAssemblyName.Value;
+
+        /// <summary>
+        /// Resolves the entry assembly name of the top-level executable
+        /// </summary>
+        /// <returns>The entry assembly name of the top-level executable</returns>
+        private static string ResolveEntryAssemblyName()
+        {
+            var inherited = Environment.GetEnvironmentVariable(ENTRY_ASSEMBLY_ENV_NAME);
+            if (!string.IsNullOrWhiteSpace(inherited))
+                return inherited.Trim();
+
+            var assemblyName = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Name;
+            return string.IsNullOrWhiteSpace(assemblyName) ? "Unknown" : assemblyName;
+        }
+
+        /// <summary>
         /// The named executables that are installed via packages
         /// </summary>
         public enum NamedExecutable
@@ -108,7 +143,11 @@ namespace Duplicati.Library.AutoUpdater
             /// <summary>
             /// The auto tune tool
             /// </summary>
-            AutoTuneTool
+            AutoTuneTool,
+            /// <summary>
+            /// The stand-alone update helper
+            /// </summary>
+            UpdateHelper
         }
 
         /// <summary>
@@ -139,6 +178,7 @@ namespace Duplicati.Library.AutoUpdater
                 NamedExecutable.DatabaseTool => OperatingSystem.IsWindows() ? "Duplicati.CommandLine.DatabaseTool.exe" : "duplicati-database-tool",
                 NamedExecutable.ConfigureTool => OperatingSystem.IsWindows() ? "Duplicati.CommandLine.ConfigureTool.exe" : "duplicati-configure",
                 NamedExecutable.AutoTuneTool => OperatingSystem.IsWindows() ? "Duplicati.CommandLine.AutoTuneTool.exe" : "duplicati-autotune-tool",
+                NamedExecutable.UpdateHelper => OperatingSystem.IsWindows() ? "Duplicati.UpdateHelper.exe" : "duplicati-update-helper",
                 _ => throw new ArgumentException($"Named executable not known: {exe}", nameof(exe))
             };
 

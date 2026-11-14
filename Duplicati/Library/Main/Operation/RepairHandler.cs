@@ -440,7 +440,7 @@ namespace Duplicati.Library.Main.Operation
                             await FilesetVolumeWriter.ProbeUnusedFilenameNameAsync(db, m_options, timestamp, cancellationToken)
                                 .ConfigureAwait(false);
 
-                        var fsw = new FilesetVolumeWriter(m_options, fileTime);
+                        var fsw = new FilesetVolumeWriter(m_options, fileTime) { IsRemoteNameTaken = FilesetVolumeWriter.NameTakenIn(db) };
                         Logging.Log.WriteInformationMessage(LOGTAG, "ReuploadingFileset", "Re-uploading fileset {0} from {1} as remote volume registration is missing, new filename: {2}", filesetId, timestamp, fsw.RemoteFilename);
 
                         if (!string.IsNullOrEmpty(m_options.ControlFiles))
@@ -470,7 +470,10 @@ namespace Duplicati.Library.Main.Operation
                             Logging.Log.WriteDryrunMessage(LOGTAG, "WouldReUploadFileset", "would re-upload fileset {0}", fsw.RemoteFilename);
                             continue;
                         }
-                        await backendManager.PutAsync(fsw, null, null, false, null, cancellationToken).ConfigureAwait(false);
+                        // A dlist name is only the time, and the next fileset can be one second
+                        // later. Upload one at a time, and write a rename after a failed upload to
+                        // the database right away, so the next name and the next retry see it.
+                        await backendManager.PutAsync(fsw, null, null, true, () => backendManager.FlushPendingMessagesAsync(db, cancellationToken), cancellationToken).ConfigureAwait(false);
                     }
 
                     if (anyDlistUploads)
@@ -494,7 +497,7 @@ namespace Duplicati.Library.Main.Operation
                         using var compressor = DynamicLoader.CompressionLoader.GetModule(parsed.CompressionModule, stream, ArchiveMode.Read, m_options.RawOptions);
                         await using var recreatedb = await LocalRecreateDatabase.CreateAsync(db, m_options, null, cancellationToken).ConfigureAwait(false);
                         if (compressor == null)
-                            throw new UserInformationException(string.Format("Failed to load compression module: {0}", parsed.CompressionModule), "FailedToLoadCompressionModule");
+                            throw new UserInformationException(Strings.Common.CompressionModuleNotLoaded(parsed.CompressionModule, remoteVolume.Name), "FailedToLoadCompressionModule");
 
                         var filesetid = await db
                             .CreateFilesetAsync(remoteVolume.ID, parsed.Time, cancellationToken)
@@ -567,7 +570,7 @@ namespace Duplicati.Library.Main.Operation
                             // backend manager renames it, as it does for any failed upload.
                             if (string.Equals(VolumeBase.GenerateFilename(RemoteVolumeType.Files, m_options, null, nameTime), n.Name, StringComparison.Ordinal))
                             {
-                                var sameNameWriter = newEntry = new FilesetVolumeWriter(m_options, nameTime);
+                                var sameNameWriter = newEntry = new FilesetVolumeWriter(m_options, nameTime) { IsRemoteNameTaken = FilesetVolumeWriter.NameTakenIn(db) };
                                 await RunRepairDlistInPlaceAsync(backendManager, db, sameNameWriter, n, cancellationToken).ConfigureAwait(false);
                                 continue;
                             }
@@ -575,7 +578,7 @@ namespace Duplicati.Library.Main.Operation
                             var fileTime =
                                 await FilesetVolumeWriter.ProbeUnusedFilenameNameAsync(db, m_options, timestamp, cancellationToken)
                                     .ConfigureAwait(false);
-                            var volumeWriter = newEntry = new FilesetVolumeWriter(m_options, fileTime);
+                            var volumeWriter = newEntry = new FilesetVolumeWriter(m_options, fileTime) { IsRemoteNameTaken = FilesetVolumeWriter.NameTakenIn(db) };
 
                             // Otherwise the replacement file needs a name that is not taken, but the fileset
                             // itself keeps its original time: the fileset time is what orders the
@@ -1462,7 +1465,7 @@ namespace Duplicati.Library.Main.Operation
                 using var stream = new FileStream(tmpfile, FileMode.Open, FileAccess.Read, FileShare.Read);
                 using var compressor = DynamicLoader.CompressionLoader.GetModule(parsed.CompressionModule, stream, ArchiveMode.Read, m_options.RawOptions);
                 if (compressor == null)
-                    throw new UserInformationException(string.Format("Failed to load compression module: {0}", parsed.CompressionModule), "FailedToLoadCompressionModule");
+                    throw new UserInformationException(Strings.Common.CompressionModuleNotLoaded(parsed.CompressionModule, volume.Name), "FailedToLoadCompressionModule");
 
                 // Clear out the old fileset
                 await db

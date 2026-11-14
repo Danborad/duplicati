@@ -22,11 +22,14 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Localization.Short;
 using Duplicati.Library.Utility;
 using Duplicati.Library.Utility.Options;
+using Duplicati.StreamUtil;
+using Newtonsoft.Json;
 
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
@@ -36,7 +39,9 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
 {
     private static readonly string TOKEN_URL = AuthIdOptionsHelper.GetOAuthLoginUrl("jottacloud", null);
     private const string JFS_ROOT = "https://jfs.jottacloud.com/jfs";
-    private const string JFS_ROOT_UPLOAD = "https://up.jottacloud.com/jfs"; // Separate host for uploading files
+    private const string JFS_ROOT_UPLOAD = "https://up.jottacloud.com/jfs"; // Separate host for uploading files with the legacy upload
+    private const string JFS_API_ROOT = "https://api.jottacloud.com"; // Host for the newer API, used to allocate uploads
+    private const string JFS_ALLOCATE_URL = JFS_API_ROOT + "/files/v1/allocate";
     private const string JFS_BUILTIN_DEVICE = "Jotta"; // The built-in device used for the built-in Sync and Archive mount points.
     private static readonly string JFS_DEFAULT_BUILTIN_MOUNT_POINT = "Archive"; // When using the built-in device we pick this mount point as our default.
     private static readonly string JFS_DEFAULT_CUSTOM_MOUNT_POINT = "Duplicati"; // When custom device is specified then we pick this mount point as our default.
@@ -46,6 +51,7 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     private const string JFS_MOUNT_POINT_OPTION = "jottacloud-mountpoint";
     private const string JFS_THREADS = "jottacloud-threads";
     private const string JFS_CHUNKSIZE = "jottacloud-chunksize";
+    private const string JFS_LEGACY_UPLOAD = "jottacloud-legacy-upload";
     private const string JFS_DATE_FORMAT = "yyyy'-'MM'-'dd-'T'HH':'mm':'ssK";
     private readonly string m_device;
     private readonly bool m_device_builtin;
@@ -56,13 +62,27 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     private static readonly string JFS_DEFAULT_THREADS = "4";
     private readonly int m_threads;
     private readonly long m_chunksize;
+    private readonly bool m_legacyUpload;
     private readonly TimeoutOptionsHelper.Timeouts m_timeouts;
 
     private JottacloudAuthHelper? m_oauth;
     private readonly HttpClient? m_httpClient;
     private readonly AuthIdOptionsHelper.AuthIdOptions m_authIdOptions;
 
-    private record Urls(string Url, string DeviceUrl, string UploadUrl);
+    /// <summary>
+    /// How long to hold back requests after a rate limit that did not say how long to wait
+    /// </summary>
+    private static readonly TimeSpan RATE_LIMIT_DELAY = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// The URLs and paths used for the requests
+    /// </summary>
+    /// <param name="Url">The URL of the folder on the JFS host</param>
+    /// <param name="DeviceUrl">The URL of the device on the JFS host</param>
+    /// <param name="UploadUrl">The URL of the folder on the legacy upload host</param>
+    /// <param name="AccountUrl">The URL that identifies the account, used to share the rate limit</param>
+    /// <param name="AllocatePath">The unescaped path of the folder, as the allocate API expects it</param>
+    private record Urls(string Url, string DeviceUrl, string UploadUrl, string AccountUrl, string AllocatePath);
     private Urls? m_urls;
 
     public Jottacloud()
@@ -162,6 +182,7 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
             throw new ArgumentOutOfRangeException(nameof(chunksize), $"The chunk size cannot be less than {Utility.Utility.FormatSizeString(1024)}, nor larger than {Utility.Utility.FormatSizeString(int.MaxValue)}");
 
         m_chunksize = chunksize;
+        m_legacyUpload = Utility.Utility.ParseBoolOption(options, JFS_LEGACY_UPLOAD);
         m_timeouts = TimeoutOptionsHelper.Parse(options);
     }
 
@@ -199,7 +220,9 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
             var url = url_device + "/" + m_mountPoint + "/" + m_path;
             var url_upload = JFS_ROOT_UPLOAD + "/" + m_oauth.Username + "/" + m_device + "/" + m_mountPoint + "/" + m_path; // Different hostname, else identical to m_url.
 
-            m_urls = new Urls(url, url_device, url_upload);
+            var allocatePath = "/jfs/" + m_device + "/" + m_mountPoint + "/" + m_path; // The allocate API takes the path without the username
+
+            m_urls = new Urls(url, url_device, url_upload, JFS_ROOT + "/" + m_oauth.Username, allocatePath);
         }
 
         return (m_oauth, m_urls);
@@ -209,16 +232,14 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancelToken)
     {
         var doc = new System.Xml.XmlDocument();
-        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
         try
         {
             // Send request and load XML response.
             using var req = await CreateRequest(HttpMethod.Get, "", "", false, cancelToken).ConfigureAwait(false);
 
-            using var response = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken,
-                innerCancellationToken => client.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, innerCancellationToken)).ConfigureAwait(false);
+            using var response = await SendAsync(req, HttpCompletionOption.ResponseHeadersRead, m_timeouts.ListTimeout, cancelToken).ConfigureAwait(false);
             await using var rs = await response.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
-            await using var ts = rs.ObserveReadTimeout(m_timeouts.ReadWriteTimeout);
+            await using var ts = rs.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
             doc.Load(ts);
 
         }
@@ -305,20 +326,16 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     /// <returns>The file entry</returns>
     private async Task<IFileEntry?> Info(string remotename, CancellationToken cancelToken)
     {
-        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
         var doc = new System.Xml.XmlDocument();
         try
         {
             // Send request and load XML response.
             using var req = await CreateRequest(HttpMethod.Get, remotename, "", false, cancelToken).ConfigureAwait(false);
 
-            using var response = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken,
-                    innerCancellationToken =>
-                        client.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, innerCancellationToken))
-                .ConfigureAwait(false);
+            using var response = await SendAsync(req, HttpCompletionOption.ResponseHeadersRead, m_timeouts.ListTimeout, cancelToken).ConfigureAwait(false);
 
             await using var rs = await response.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
-            await using var ts = rs.ObserveReadTimeout(m_timeouts.ReadWriteTimeout);
+            await using var ts = rs.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
             doc.Load(ts);
         }
         catch (HttpRequestException wex)
@@ -356,11 +373,8 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     /// <inheritdoc/>
     public async Task DeleteAsync(string remotename, CancellationToken cancelToken)
     {
-        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
-
         using var req = await CreateRequest(HttpMethod.Post, remotename, "rm=true", false, cancelToken).ConfigureAwait(false); // rm=true means permanent delete, dl=true would be move to trash.
-        using var response = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken,
-            innerCancellationToken => client.GetResponseAsync(req, HttpCompletionOption.ResponseContentRead, innerCancellationToken)).ConfigureAwait(false);
+        using var response = await SendAsync(req, HttpCompletionOption.ResponseContentRead, m_timeouts.ListTimeout, cancelToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -370,6 +384,7 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
         new CommandLineArgument(JFS_MOUNT_POINT_OPTION, CommandLineArgument.ArgumentType.String, Strings.Jottacloud.DescriptionMountPointShort, Strings.Jottacloud.DescriptionMountPointLong(JFS_DEVICE_OPTION)),
         new CommandLineArgument(JFS_THREADS, CommandLineArgument.ArgumentType.Integer, Strings.Jottacloud.ThreadsShort, Strings.Jottacloud.ThreadsLong, JFS_DEFAULT_THREADS),
         new CommandLineArgument(JFS_CHUNKSIZE, CommandLineArgument.ArgumentType.Size, Strings.Jottacloud.ChunksizeShort, Strings.Jottacloud.ChunksizeLong, JFS_DEFAULT_CHUNKSIZE),
+        new CommandLineArgument(JFS_LEGACY_UPLOAD, CommandLineArgument.ArgumentType.Boolean, Strings.Jottacloud.LegacyUploadShort, Strings.Jottacloud.LegacyUploadLong, "false"),
         .. TimeoutOptionsHelper.GetOptions(),
     ];
 
@@ -386,21 +401,19 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     /// <inheritdoc/>
     public async Task CreateFolderAsync(CancellationToken cancelToken)
     {
-        (var client, var urls) = await GetClient(cancelToken).ConfigureAwait(false);
+        (var _, var urls) = await GetClient(cancelToken).ConfigureAwait(false);
 
         // When using custom (backup) device we must create the device first (if not already exists).
         if (!m_device_builtin)
         {
             using var request = await CreateRequest(urls.DeviceUrl, "type=WORKSTATION", HttpMethod.Post, cancelToken).ConfigureAwait(false); // Hard-coding device type. Must be one of "WORKSTATION", "LAPTOP", "IMAC", "MACBOOK", "IPAD", "ANDROID", "IPHONE" or "WINDOWS_PHONE".
 
-            using var response = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken,
-                innerCancellationToken => client.GetResponseAsync(request, HttpCompletionOption.ResponseContentRead, innerCancellationToken)).ConfigureAwait(false);
+            using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, m_timeouts.ListTimeout, cancelToken).ConfigureAwait(false);
         }
         // Create the folder path, and if using custom mount point it will be created as well in the same operation.
         {
             using var request = await CreateRequest(HttpMethod.Post, "", "mkDir=true", false, cancelToken).ConfigureAwait(false);
-            using var response = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken,
-                innerCancellationToken => client.GetResponseAsync(request, HttpCompletionOption.ResponseContentRead, innerCancellationToken)).ConfigureAwait(false);
+            using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, m_timeouts.ListTimeout, cancelToken).ConfigureAwait(false);
         }
     }
 
@@ -422,7 +435,11 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     /// <returns></returns>
     private async Task<HttpRequestMessage> CreateRequest(string url, string queryparams, HttpMethod? method, CancellationToken cancelToken)
     {
-        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
+        (var client, var urls) = await GetClient(cancelToken).ConfigureAwait(false);
+
+        // Hold back while the account is rate limited, before the request gets its access token
+        await GetRateLimitGate(urls).WaitForRetryAfterAsync(cancelToken).ConfigureAwait(false);
+
         return await client.CreateRequestAsync(url + (string.IsNullOrEmpty(queryparams) || queryparams.Trim().Length == 0 ? "" : "?" + queryparams),
              method == null ? HttpMethod.Get : method, CancellationToken.None).ConfigureAwait(false);
     }
@@ -442,10 +459,50 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
         return await CreateRequest((upload ? urls.UploadUrl : urls.Url) + Utility.UrlEncoding.UrlEncode(remotename).Replace("+", "%20"), queryparams, method, cancelToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Gets the gate that holds back requests to the account while it is rate limited.
+    /// The gate is shared by all backend instances for the same account, so parallel
+    /// transfers and the next operation also wait.
+    /// </summary>
+    /// <param name="urls">The URLs for the account</param>
+    /// <returns>The gate</returns>
+    private static RetryAfterHelper GetRateLimitGate(Urls urls)
+        => RetryAfterHelper.CreateOrGetRetryAfterHelper(urls.AccountUrl);
+
+    /// <summary>
+    /// Sends a request, and closes the rate limit gate for the account if the server
+    /// answers that too many requests are being sent
+    /// </summary>
+    /// <param name="req">The request to send</param>
+    /// <param name="completionOption">When the call completes</param>
+    /// <param name="timeout">The timeout for the call</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The response</returns>
+    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, HttpCompletionOption completionOption, TimeSpan timeout, CancellationToken cancelToken)
+    {
+        (var client, var urls) = await GetClient(cancelToken).ConfigureAwait(false);
+        try
+        {
+            return await Utility.Utility.WithTimeout(timeout, cancelToken,
+                innerCancellationToken => client.GetResponseAsync(req, completionOption, innerCancellationToken)).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex) when (ex.InnerException is TooManyRequestException rateLimit)
+        {
+            // Jottacloud does not promise a Retry-After value, so wait a while if none is given
+            var retryAfter = rateLimit.RetryAfter;
+            if (retryAfter?.Delta == null && retryAfter?.Date == null)
+                retryAfter = new RetryConditionHeaderValue(RATE_LIMIT_DELAY);
+
+            GetRateLimitGate(urls).SetRetryAfter(retryAfter);
+            throw;
+        }
+    }
+
     /// <inheritdoc/>
     public Task<string[]> GetDNSNamesAsync(CancellationToken cancelToken) => Task.FromResult(new string[] {
-        new System.Uri(JFS_ROOT).Host,
-        new System.Uri(JFS_ROOT_UPLOAD).Host
+        new Uri(JFS_ROOT).Host,
+        new Uri(JFS_ROOT_UPLOAD).Host,
+        new Uri(JFS_API_ROOT).Host
     });
 
     /// <inheritdoc/>
@@ -460,13 +517,11 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
         // Downloading from Jottacloud: Will only succeed if the file has a completed revision,
         // and if there are multiple versions of the file we will only get the latest completed version,
         // ignoring any incomplete or corrupt versions.
-        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
         using var req = await CreateRequest(HttpMethod.Get, remotename, "mode=bin", false, cancelToken).ConfigureAwait(false);
-        using var response = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, innerCancellationToken =>
-              client.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, innerCancellationToken)).ConfigureAwait(false);
+        using var response = await SendAsync(req, HttpCompletionOption.ResponseHeadersRead, m_timeouts.ShortTimeout, cancelToken).ConfigureAwait(false);
 
         await using var s = await response.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
-        await using var t = s.ObserveReadTimeout(m_timeouts.ReadWriteTimeout);
+        await using var t = s.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
         await Utility.Utility.CopyStreamAsync(t, stream, true, cancelToken).ConfigureAwait(false);
     }
 
@@ -516,12 +571,10 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
                 {
                     try
                     {
-                        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
                         using var request = await CreateRequest(HttpMethod.Get, remotename, "mode=bin", false, cancelToken).ConfigureAwait(false);
                         request.Headers.Range = new RangeHeaderValue(chunk.start, chunk.end - 1);
 
-                        using var response = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, innerCancellationToken =>
-                            client.GetResponseAsync(request, HttpCompletionOption.ResponseHeadersRead, innerCancellationToken)).ConfigureAwait(false);
+                        using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead, m_timeouts.ShortTimeout, cancelToken).ConfigureAwait(false);
 
                         // Verify Content-Range header
                         var contentRange = response.Content.Headers.ContentRange;
@@ -529,7 +582,7 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
                             throw new InvalidOperationException($"Invalid Content-Range response for chunk {chunk.start}-{chunk.end - 1}");
 
                         await using var responseStream = await response.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
-                        await using var timeoutStream = responseStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout);
+                        await using var timeoutStream = responseStream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
                         using var memoryStream = new MemoryStream();
                         await timeoutStream.CopyToAsync(memoryStream, cancelToken).ConfigureAwait(false);
 
@@ -583,7 +636,196 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
     /// <inheritdoc/>
     public async Task PutAsync(string remotename, Stream stream, CancellationToken cancelToken)
     {
+        // Both ways of uploading need the MD5 hash of the content before it is sent
+        (stream, var md5Hash, var tmp) = await Utility.Utility.CalculateThrottledStreamHash(stream, "MD5", cancelToken).ConfigureAwait(false);
+        using var _ = tmp;
 
+        if (m_legacyUpload)
+            await LegacyPutAsync(remotename, stream, md5Hash, cancelToken).ConfigureAwait(false);
+        else
+            await AllocatePutAsync(remotename, stream, md5Hash, cancelToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Uploads a file the way the Jottacloud clients do: the upload is first allocated with the
+    /// size and MD5 hash of the content, and the content is then sent to the URL the allocation
+    /// returns. Content the server already has is not sent again, and an interrupted upload is
+    /// resumed from where it stopped.
+    /// </summary>
+    /// <param name="remotename">The remote file name</param>
+    /// <param name="stream">The content to upload</param>
+    /// <param name="md5Hash">The MD5 hash of the content, as a hex string</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    private async Task AllocatePutAsync(string remotename, Stream stream, string md5Hash, CancellationToken cancelToken)
+    {
+        (var _, var urls) = await GetClient(cancelToken).ConfigureAwait(false);
+
+        var fileSize = stream.Length;
+        var md5 = md5Hash.ToLowerInvariant();
+        var timestamp = DateTime.UtcNow.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'Z'", System.Globalization.CultureInfo.InvariantCulture);
+
+        AllocateFileResponse allocation;
+        using (var req = await CreateRequest(JFS_ALLOCATE_URL, "", HttpMethod.Post, cancelToken).ConfigureAwait(false))
+        {
+            req.Content = new StringContent(JsonConvert.SerializeObject(new AllocateFileRequest
+            {
+                Bytes = fileSize,
+                Created = timestamp,
+                Modified = timestamp,
+                Md5 = md5,
+                Path = urls.AllocatePath + remotename
+            }), Encoding.UTF8, "application/json");
+
+            using var response = await SendAsync(req, HttpCompletionOption.ResponseContentRead, m_timeouts.ShortTimeout, cancelToken).ConfigureAwait(false);
+            allocation = await ReadJsonAsync<AllocateFileResponse>(response, cancelToken).ConfigureAwait(false);
+        }
+
+        // The server already has this content at this path, so there is nothing to send
+        if (allocation.State == "COMPLETED")
+            return;
+
+        if (string.IsNullOrWhiteSpace(allocation.UploadUrl))
+            throw new HttpRequestException(HttpRequestError.InvalidResponse, Strings.Jottacloud.FileUploadError);
+
+        var resumePos = allocation.ResumePos;
+        if (resumePos < 0 || resumePos > fileSize)
+            throw new HttpRequestException(HttpRequestError.InvalidResponse, Strings.Jottacloud.FileUploadError);
+
+        // Skip the part the server already has from an earlier, interrupted upload
+        if (resumePos > 0)
+            await SkipAsync(stream, resumePos, cancelToken).ConfigureAwait(false);
+
+        using var uploadReq = await CreateRequest(allocation.UploadUrl, "", HttpMethod.Post, cancelToken).ConfigureAwait(false);
+        if (resumePos > 0)
+            uploadReq.Headers.Range = new RangeHeaderValue(resumePos, fileSize - 1);
+
+        await using var timeoutStream = stream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
+        uploadReq.Content = new StreamContent(timeoutStream);
+        uploadReq.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        uploadReq.Content.Headers.ContentLength = fileSize - resumePos;
+
+        // The read-write timeout on the stream guards the upload, so the request itself has no timeout
+        using var uploadResponse = await SendAsync(uploadReq, HttpCompletionOption.ResponseContentRead, Timeout.InfiniteTimeSpan, cancelToken).ConfigureAwait(false);
+        var result = await ReadJsonAsync<UploadResponse>(uploadResponse, cancelToken).ConfigureAwait(false);
+
+        // The server reports what it stored; anything other than our content is a failed upload
+        if ((result.Bytes > 0 && result.Bytes != fileSize) || (!string.IsNullOrWhiteSpace(result.Md5) && !string.Equals(result.Md5, md5, StringComparison.OrdinalIgnoreCase)))
+            throw new HttpRequestException(HttpRequestError.InvalidResponse, Strings.Jottacloud.FileUploadError, null, uploadResponse.StatusCode);
+    }
+
+    /// <summary>
+    /// Reads past the start of a stream
+    /// </summary>
+    /// <param name="stream">The stream</param>
+    /// <param name="count">The number of bytes to skip</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    private static async Task SkipAsync(Stream stream, long count, CancellationToken cancelToken)
+    {
+        if (stream.CanSeek)
+        {
+            stream.Position += count;
+            return;
+        }
+
+        var buffer = new byte[64 * 1024];
+        while (count > 0)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, count)), cancelToken).ConfigureAwait(false);
+            if (read == 0)
+                throw new EndOfStreamException();
+            count -= read;
+        }
+    }
+
+    /// <summary>
+    /// Reads a JSON response from the newer API
+    /// </summary>
+    /// <typeparam name="T">The type of the response</typeparam>
+    /// <param name="response">The response</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The parsed response</returns>
+    private static async Task<T> ReadJsonAsync<T>(HttpResponseMessage response, CancellationToken cancelToken)
+        where T : class
+    {
+        var body = await response.Content.ReadAsStringAsync(cancelToken).ConfigureAwait(false);
+        try
+        {
+            return JsonConvert.DeserializeObject<T>(body)
+                ?? throw new HttpRequestException(HttpRequestError.InvalidResponse, Strings.Jottacloud.FileUploadError, null, response.StatusCode);
+        }
+        catch (JsonException jex)
+        {
+            throw new HttpRequestException(HttpRequestError.InvalidResponse, Strings.Jottacloud.FileUploadError, jex, response.StatusCode);
+        }
+    }
+
+    /// <summary>
+    /// The request that allocates an upload
+    /// </summary>
+    private sealed class AllocateFileRequest
+    {
+        [JsonProperty("bytes")]
+        public long Bytes { get; set; }
+        [JsonProperty("created")]
+        public string? Created { get; set; }
+        [JsonProperty("md5")]
+        public string? Md5 { get; set; }
+        [JsonProperty("modified")]
+        public string? Modified { get; set; }
+        [JsonProperty("path")]
+        public string? Path { get; set; }
+    }
+
+    /// <summary>
+    /// The answer to an allocation, which says where to send the content and how much the server already has
+    /// </summary>
+    private sealed class AllocateFileResponse
+    {
+        [JsonProperty("name")]
+        public string? Name { get; set; }
+        [JsonProperty("path")]
+        public string? Path { get; set; }
+        [JsonProperty("state")]
+        public string? State { get; set; }
+        [JsonProperty("upload_id")]
+        public string? UploadId { get; set; }
+        [JsonProperty("upload_url")]
+        public string? UploadUrl { get; set; }
+        [JsonProperty("bytes")]
+        public long Bytes { get; set; }
+        [JsonProperty("resume_pos")]
+        public long ResumePos { get; set; }
+    }
+
+    /// <summary>
+    /// The answer to an upload, with what the server stored
+    /// </summary>
+    private sealed class UploadResponse
+    {
+        [JsonProperty("path")]
+        public string? Path { get; set; }
+        [JsonProperty("content_id")]
+        public string? ContentId { get; set; }
+        [JsonProperty("bytes")]
+        public long Bytes { get; set; }
+        [JsonProperty("md5")]
+        public string? Md5 { get; set; }
+        [JsonProperty("modified")]
+        public long Modified { get; set; }
+    }
+
+    /// <summary>
+    /// Uploads a file with a single request to the legacy upload host
+    /// </summary>
+    /// <param name="remotename">The remote file name</param>
+    /// <param name="stream">The content to upload</param>
+    /// <param name="md5Hash">The MD5 hash of the content, as a hex string</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    private async Task LegacyPutAsync(string remotename, Stream stream, string md5Hash, CancellationToken cancelToken)
+    {
         //   Some challenges with uploading to Jottacloud:
         // - Jottacloud supports use of a custom header where we can tell the server the MD5 hash of the file
         //   we are uploading, and then it will verify the content of our request against it. But the HTTP
@@ -600,9 +842,6 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
         //   we specify the file size in a custom header. And if the stream is not seek-able we are not able
         //   to use stream.Length, so we are back at square one.
 
-        (stream, var md5Hash, var tmp) = await Utility.Utility.CalculateThrottledStreamHash(stream, "MD5", cancelToken).ConfigureAwait(false);
-        using var _ = tmp;
-
         // Create request, with query parameter, and a few custom headers.
         // NB: If we wanted to we could send the same POST request as below but without the file contents
         // and with "cphash=[md5Hash]" as the only query parameter. Then we will get an HTTP 200 (OK) response
@@ -615,14 +854,14 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
         req.Headers.Add("JMd5", md5Hash); // Not required, but it will make the server verify the content and mark the file as corrupt if there is a mismatch.
         req.Headers.Add("JSize", fileSize.ToString()); // Required, and used to mark file as incomplete if we upload something  be the total size of the original file!
 
-        await using var timeoutStream = stream.ObserveReadTimeout(this.m_timeouts.ReadWriteTimeout, false);
+        await using var timeoutStream = stream.ObserveReadTimeout(this.m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
         req.Content = new StreamContent(timeoutStream);
 
         req.Content.Headers.Add("Content-Type", "application/octet-stream");
         req.Content.Headers.Add("Content-Length", fileSize.ToString());
 
-        (var client, var _) = await GetClient(cancelToken).ConfigureAwait(false);
-        using var response = await client.GetResponseAsync(req, HttpCompletionOption.ResponseContentRead, cancelToken).ConfigureAwait(false);
+        // The read-write timeout on the stream guards the upload, so the request itself has no timeout
+        using var response = await SendAsync(req, HttpCompletionOption.ResponseContentRead, Timeout.InfiniteTimeSpan, cancelToken).ConfigureAwait(false);
 
         if (response.StatusCode != HttpStatusCode.Created)
             throw new HttpRequestException(HttpRequestError.HttpProtocolError, Strings.Jottacloud.FileUploadError, null, response.StatusCode);
@@ -662,11 +901,9 @@ public class Jottacloud : IStreamingBackend, IRenameEnabledBackend
 
     public async Task RenameAsync(string oldname, string newname, CancellationToken cancellationToken)
     {
-        (var client, var _) = await GetClient(cancellationToken).ConfigureAwait(false);
         var destPath = "/" + m_path + newname;
         using var req = await CreateRequest(HttpMethod.Post, oldname, "mv=" + Utility.UrlEncoding.UrlEncode(destPath), false, cancellationToken).ConfigureAwait(false);
-        using var response = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken,
-            innerCancellationToken => client.GetResponseAsync(req, HttpCompletionOption.ResponseContentRead, innerCancellationToken)).ConfigureAwait(false);
+        using var response = await SendAsync(req, HttpCompletionOption.ResponseContentRead, m_timeouts.ShortTimeout, cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.OK)
             throw new HttpRequestException(HttpRequestError.HttpProtocolError, Strings.Jottacloud.FileUploadError, null, response.StatusCode);

@@ -104,12 +104,14 @@ namespace Duplicati.Server
 
         public IList<Tuple<string, DateTime>> GetProposedSchedule()
         {
+            // Disabled backups are skipped when their schedule fires, so they have no upcoming run
+            var disabled = m_dataConnection.GetDisabledBackupIDs();
             return (
                 from n in this.Schedule
                 let backupid = (from t in n.Value.Tags
                                 where t != null && t.StartsWith("ID=", StringComparison.Ordinal)
                                 select t.Substring("ID=".Length)).FirstOrDefault()
-                where !string.IsNullOrWhiteSpace(backupid)
+                where !string.IsNullOrWhiteSpace(backupid) && !disabled.Contains(backupid)
                 select new Tuple<string, DateTime>(backupid, n.Key)
             ).ToList();
         }
@@ -167,7 +169,7 @@ namespace Duplicati.Server
         /// <param name="allowedDays">The days the backup is allowed to run</param>
         /// <returns>The next valid date, or throws an exception if no such date can be found</returns>
         public static DateTime GetNextValidTime(DateTime basetime, DateTime firstdate, string repetition,
-            DayOfWeek[] allowedDays, TimeZoneInfo timeZoneInfo)
+            DayOfWeek[]? allowedDays, TimeZoneInfo timeZoneInfo)
         {
             var res = basetime;
             var ts = Timeparser.ParseTimeSpan(repetition);
@@ -181,12 +183,14 @@ namespace Duplicati.Server
             {
                 if (ts.TotalDays >= 1)
                 {
-                    // We jump in days, so we pick the first valid day after firstdate
+                    // We jump in days, so we pick the first valid day after firstdate.
+                    // The skipped days must keep the local time of day, as daylight saving
+                    // time changes on a Sunday, which a weekday-only schedule skips over
                     for (var n = 0; n < 8; n++)
                         if (IsDateAllowed(res, allowedDays, timeZoneInfo))
                             break;
                         else
-                            res = res.AddDays(1);
+                            res = Timeparser.DSTAwareParseTimeInterval("1D", res, timeZoneInfo);
                 }
                 else
                 {
@@ -215,6 +219,23 @@ namespace Duplicati.Server
             return res;
         }
 
+        /// <summary>
+        /// Checks if a backup is still covered by a repeating schedule
+        /// </summary>
+        /// <param name="backupId">The ID of the backup</param>
+        /// <returns><c>true</c> if a schedule still runs the backup</returns>
+        private bool IsScheduled(string backupId)
+            => m_dataConnection.Schedules
+                .Where(sc => !string.IsNullOrEmpty(sc.Repeat))
+                .Any(sc => m_dataConnection.GetBackupIDsForTags(sc.Tags).Any(id => id.ToString() == backupId));
+
+        /// <summary>
+        /// Thrown when a queued scheduled run is about to start, but its backup is no longer scheduled
+        /// </summary>
+        /// <param name="backupId">The ID of the backup</param>
+        public sealed class RunNoLongerScheduledException(string backupId)
+            : Exception($"The scheduled run of backup {backupId} was skipped, as the backup is no longer scheduled");
+
         private Task OnCompletedAsync(Runner.IRunnerData task)
         {
             Tuple<ISchedule, DateTime, DateTime>? t = null;
@@ -238,6 +259,15 @@ namespace Duplicati.Server
         {
             if (task is null)
                 return Task.CompletedTask;
+
+            // A run can wait in the queue, as it does while the server is paused after a start;
+            // if the schedule of the backup was removed meanwhile, the run is no longer wanted
+            if (task.BackupID != null && !IsScheduled(task.BackupID))
+            {
+                lock (m_lock)
+                    m_updateTasks.Remove(task);
+                throw new RunNoLongerScheduledException(task.BackupID);
+            }
 
             lock (m_lock)
             {
@@ -345,7 +375,14 @@ namespace Duplicati.Server
                                 if (!tmplst.Any(x => x == id))
                                 {
                                     var entry = m_dataConnection.GetBackup(id);
-                                    if (entry != null)
+                                    if (entry != null && !entry.Enabled)
+                                    {
+                                        // The schedule still advances, so the backup resumes at its next slot once enabled
+                                        Library.Logging.Log.WriteInformationMessage(LOGTAG,
+                                            "BackupDisabled",
+                                            "Skipping scheduled run of backup {0} because it is disabled.", entry.Name);
+                                    }
+                                    else if (entry != null)
                                     {
                                         var options = Server.Runner.GetCommonOptions(m_dataConnection);
                                         Server.Runner.ApplyOptions(m_dataConnection, entry, options, out var _);
@@ -472,7 +509,7 @@ namespace Duplicati.Server
         /// <param name="allowedDays">The allowed days</param>
         /// <param name="timeZoneInfo">The time zone info</param>
         /// <returns>True if the backup is allowed to run, false otherwise</returns>
-        private static bool IsDateAllowed(DateTime time, DayOfWeek[] allowedDays, TimeZoneInfo timeZoneInfo)
+        private static bool IsDateAllowed(DateTime time, DayOfWeek[]? allowedDays, TimeZoneInfo timeZoneInfo)
         {
             if (allowedDays == null || allowedDays.Length == 0)
                 return true;

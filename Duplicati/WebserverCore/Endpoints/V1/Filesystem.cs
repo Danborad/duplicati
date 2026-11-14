@@ -165,8 +165,8 @@ public class Filesystem : IEndpointV1
                         systemFile = false,
                         fileSize = -1,
                         resolvedpath = x.resolvedpath,
+                        kind = x.kind,
                         check = false
-
                     })
                     // Add plugins for Hyper-V and MSSQL
                     .Concat(FilesystemPlugins.KnownPlugins.GetPlugins(GetApplicationSettings(connection))
@@ -185,15 +185,21 @@ public class Filesystem : IEndpointV1
                     leaf = x.leaf,
                     hidden = x.hidden,
                     symlink = x.symlink,
+                    symlinkTarget = x.symlinkTarget,
                     temporary = x.temporary,
                     systemFile = x.systemFile,
                     fileSize = x.fileSize,
                     resolvedpath = x.id,
+                    kind = x.kind,
                     check = false
                 });
             }
 
             return res.ToList();
+        }
+        catch (UserReportedHttpException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -229,6 +235,12 @@ public class Filesystem : IEndpointV1
                         : driveInfo.VolumeLabel + " - " + driveInfo.RootDirectory.FullName.Replace('\\', ' ')
                     ) + "(" + driveInfo.DriveType + ")",
                 iconCls = "x-tree-icon-drive",
+                kind = driveInfo.DriveType switch
+                {
+                    DriveType.Network => "drive:network",
+                    DriveType.Removable => "drive:removable",
+                    _ => "drive"
+                },
                 cls = "folder",
                 leaf = false,
                 hidden = false,
@@ -279,12 +291,19 @@ public class Filesystem : IEndpointV1
             return false;
         };
 
-        IEnumerable<string> entries;
+        List<string> entries;
         try
         {
-            entries = SystemIO.IO_OS.EnumerateFileSystemEntries(entrypath);
+            entries = SystemIO.IO_OS.EnumerateFileSystemEntries(entrypath).ToList();
         }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or DirectoryNotFoundException or IOException)
+        catch (UnauthorizedAccessException)
+        {
+            // The folder may not be listed. The compatibility junctions in a Windows profile, such as
+            // Cookies and Application Data, deny List folder to Everyone, so they cannot be expanded.
+            // The listing of the parent already reports such a folder as locked
+            throw new ForbiddenException($"Access to the folder is denied: {entrypath}");
+        }
+        catch (Exception ex) when (ex is DirectoryNotFoundException or IOException)
         {
             Library.Logging.Log.WriteWarningMessage(LOGTAG, "ListFolderFailed", ex, $"Cannot access folder: {entrypath}");
             yield break;
@@ -346,10 +365,15 @@ public class Filesystem : IEndpointV1
                     systemFile = isSystem,
                     fileSize = fileSize,
                     iconCls = isFolder ? (accessible ? (isSymlink ? "x-tree-icon-symlink" : "x-tree-icon-parent") : "x-tree-icon-locked") : "x-tree-icon-leaf",
+                    // Symlinks are flagged by the symlink property instead
+                    kind = accessible ? null : "locked",
                     leaf = isLeaf,
                     cls = isFolder ? "folder" : "file",
                     check = false,
-                    resolvedpath = isSymlink ? SystemIO.IO_OS.GetSymlinkTarget(s) : null
+                    // resolvedpath is the path of the entry when it is listed below a special folder
+                    // such as %HOME%, and is not needed otherwise, so the link target has its own field
+                    resolvedpath = null,
+                    symlinkTarget = isSymlink ? SystemIO.IO_OS.GetSymlinkTarget(s) : null
                 };
             }
             catch

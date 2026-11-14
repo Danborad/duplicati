@@ -37,6 +37,8 @@ namespace Duplicati.Library.Main.Backend
 
         private bool _anyDownloaded = false;
         private bool _anyUploaded = false;
+        // A listing that found files shows the folder was there
+        private bool _anyListed = false;
         private readonly bool _autoCreateFolders;
         private readonly string _backendUrl;
         private readonly int _maxRetries;
@@ -44,6 +46,8 @@ namespace Duplicati.Library.Main.Backend
         private readonly int _retryDelay;
         private readonly bool _retryWithExponentialBackoff;
         private int _currentRetryDelay;
+        // The backend as a streaming backend, or null if it cannot stream; transfers then go
+        // through a temporary file with the file-based IBackend methods
         private IStreamingBackend? _streamingBackend = null;
         private readonly IOperationProgressUpdater? _progressUpdater;
         private readonly IBackendProgressUpdater? _backendProgressUpdater;
@@ -75,7 +79,7 @@ namespace Duplicati.Library.Main.Backend
         {
             return RetryWithDelayAsync(
                 $"Delete {remotename}",
-                () => _streamingBackend!.DeleteAsync(remotename, token),
+                () => _backend!.DeleteAsync(remotename, token),
                 null,
                 false,
                 token
@@ -93,7 +97,7 @@ namespace Duplicati.Library.Main.Backend
             {
                 Instantiate();
 
-                return _streamingBackend!.DisplayName;
+                return _backend!.DisplayName;
             }
         }
 
@@ -104,7 +108,7 @@ namespace Duplicati.Library.Main.Backend
         {
             try
             {
-                _streamingBackend?.Dispose();
+                // The streaming backend is the same object as the backend
                 _streamingBackend = null;
                 _backend?.Dispose();
                 _backend = null;
@@ -129,7 +133,7 @@ namespace Duplicati.Library.Main.Backend
                 $"Get {remotename}",
                 async () =>
                 {
-                    await _streamingBackend!.GetAsync(remotename, stream, token).ConfigureAwait(false);
+                    await GetIntoStreamAsync(remotename, stream, token).ConfigureAwait(false);
                     _anyDownloaded = true;
                 },
                 stream,
@@ -209,13 +213,50 @@ namespace Duplicati.Library.Main.Backend
 
             _backend = DynamicLoader.BackendLoader.GetBackend(_backendUrl, _options)
                 ?? throw new InvalidOperationException("Failed to instantiate backend.");
-            _streamingBackend = _backend as IStreamingBackend;
-            if (_streamingBackend == null || !_streamingBackend.SupportsStreaming)
+            // A backend that cannot stream, such as the file backend with --use-move-for-put, or one
+            // that only implements IBackend, is used through temporary files
+            _streamingBackend = _backend is IStreamingBackend sb && sb.SupportsStreaming ? sb : null;
+        }
+
+        /// <summary>
+        /// Downloads a file into the stream, through a temporary file if the backend cannot stream.
+        /// </summary>
+        /// <param name="remotename">The name of the remote file.</param>
+        /// <param name="stream">The stream to write the file to.</param>
+        /// <param name="token">A cancellation token to cancel the operation.</param>
+        private async Task GetIntoStreamAsync(string remotename, Stream stream, CancellationToken token)
+        {
+            if (_streamingBackend != null)
             {
-                _backend.Dispose();
-                _backend = null;
-                throw new InvalidOperationException("Backend does not support streaming operations.");
+                await _streamingBackend.GetAsync(remotename, stream, token).ConfigureAwait(false);
+                return;
             }
+
+            using var temp = new TempFile();
+            await _backend!.GetAsync(remotename, temp, token).ConfigureAwait(false);
+            using var fs = System.IO.File.OpenRead(temp);
+            await fs.CopyToAsync(stream, token).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Uploads the stream, through a temporary file if the backend cannot stream.
+        /// </summary>
+        /// <param name="remotename">The name of the remote file.</param>
+        /// <param name="stream">The stream to upload.</param>
+        /// <param name="token">A cancellation token to cancel the operation.</param>
+        private async Task PutFromStreamAsync(string remotename, Stream stream, CancellationToken token)
+        {
+            if (_streamingBackend != null)
+            {
+                await _streamingBackend.PutAsync(remotename, stream, token).ConfigureAwait(false);
+                return;
+            }
+
+            // A fresh file per attempt; the backend may move it away (--use-move-for-put)
+            using var temp = new TempFile();
+            using (var fs = System.IO.File.Create(temp))
+                await stream.CopyToAsync(fs, token).ConfigureAwait(false);
+            await _backend!.PutAsync(remotename, temp, token).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -233,7 +274,9 @@ namespace Duplicati.Library.Main.Backend
             List<IFileEntry> entries = [];
             await RetryWithDelayAsync("List", async () =>
                 {
-                    entries = await _streamingBackend!.ListAsync(token).ToListAsync().ConfigureAwait(false);
+                    entries = await _backend!.ListAsync(token).ToListAsync().ConfigureAwait(false);
+                    if (entries.Count > 0)
+                        _anyListed = true;
                 },
                 null,
                 false,
@@ -263,7 +306,7 @@ namespace Duplicati.Library.Main.Backend
                     if (hashes_length_not_null && _streamingBackend is Duplicati.Library.Backend.S3 s3backend)
                         await s3backend.PutWithHashAsync(remotename, stream, md5!, sha256!, length!.Value, token).ConfigureAwait(false);
                     else
-                        await _streamingBackend!.PutAsync(remotename, stream, token).ConfigureAwait(false);
+                        await PutFromStreamAsync(remotename, stream, token).ConfigureAwait(false);
 
                     _anyUploaded = true;
                 },
@@ -322,10 +365,10 @@ namespace Duplicati.Library.Main.Backend
                     {
                         // A fresh temporary file per attempt, so a half-written download is never re-uploaded
                         using var downloaded = TempFileStream.Create();
-                        await _streamingBackend!.GetAsync(oldname, downloaded, token).ConfigureAwait(false);
+                        await GetIntoStreamAsync(oldname, downloaded, token).ConfigureAwait(false);
                         downloaded.Position = 0;
-                        await _streamingBackend!.PutAsync(newname, downloaded, token).ConfigureAwait(false);
-                        await _streamingBackend!.DeleteAsync(oldname, token).ConfigureAwait(false);
+                        await PutFromStreamAsync(newname, downloaded, token).ConfigureAwait(false);
+                        await _backend!.DeleteAsync(oldname, token).ConfigureAwait(false);
                     }
 
                     _anyUploaded = true;
@@ -339,13 +382,14 @@ namespace Duplicati.Library.Main.Backend
 
         /// <summary>
         /// Resets the state of the backend manager.
-        /// This method resets the download and upload flags and resets the retry delay to its initial value.
+        /// This method resets the download, upload and listing flags and resets the retry delay to its initial value.
         /// </summary>
         /// <returns>A task representing the asynchronous reset operation.</returns>
         public async Task ResetAsync()
         {
             _anyDownloaded = false;
             _anyUploaded = false;
+            _anyListed = false;
             _currentRetryDelay = _retryDelay;
         }
 
@@ -465,8 +509,10 @@ namespace Duplicati.Library.Main.Backend
 
             var recovered = false;
 
-            // Check if this was a folder missing exception and we are allowed to autocreate folders
-            if (!(_anyDownloaded || _anyUploaded) && _autoCreateFolders && ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
+            // Check if this was a folder missing exception and we are allowed to autocreate folders.
+            // A folder that held files has gone away, as an unplugged drive does, and creating it again
+            // would send the copies to a new, empty folder in its place.
+            if (!(_anyDownloaded || _anyUploaded || _anyListed) && _autoCreateFolders && ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
             {
                 if (await TryCreateFolderAsync(token).ConfigureAwait(false))
                     recovered = true;

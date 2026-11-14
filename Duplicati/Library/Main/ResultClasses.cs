@@ -23,11 +23,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Logging;
-using Duplicati.Library.Main.Database.Local;
 using Duplicati.Library.Main.Operation.Common;
 using Newtonsoft.Json;
 
@@ -37,6 +34,11 @@ namespace Duplicati.Library.Main
     {
         bool ReportedQuotaError { get; set; }
         bool ReportedQuotaWarning { get; set; }
+
+        /// <summary>
+        /// Called after each completed upload with the number of bytes uploaded so far in the operation
+        /// </summary>
+        Action<long> UploadCompleted { get; set; }
 
         /// <summary>
         /// The operation the backend is working for, which decides whether running out of room
@@ -117,6 +119,8 @@ namespace Duplicati.Library.Main
         public bool ReportedQuotaError { get; set; }
         public bool ReportedQuotaWarning { get; set; }
 
+        public Action<long> UploadCompleted { get; set; }
+
         public override OperationMode MainOperation { get { return m_parent.MainOperation; } }
 
         public void SendEvent(BackendActionType action, BackendEventType type, string path, long size, bool updateProgress = true)
@@ -147,7 +151,8 @@ namespace Duplicati.Library.Main
                         break;
                     case BackendActionType.Put:
                         System.Threading.Interlocked.Increment(ref m_filesUploaded);
-                        System.Threading.Interlocked.Add(ref m_bytesUploaded, size);
+                        var uploaded = System.Threading.Interlocked.Add(ref m_bytesUploaded, size);
+                        UploadCompleted?.Invoke(uploaded);
                         break;
                 }
             }
@@ -171,24 +176,8 @@ namespace Duplicati.Library.Main
         /// </summary>
         protected static readonly int SERIALIZATION_LIMIT = 20;
 
-        protected class DbMessage
-        {
-            public readonly string Type;
-            public readonly string Message;
-            public readonly Exception Exception;
-
-            public DbMessage(string type, string message, Exception ex)
-            {
-                this.Type = type;
-                this.Message = message;
-                this.Exception = ex;
-            }
-        }
-
         protected readonly BasicResults m_parent;
         protected System.Threading.Thread m_callerThread;
-        protected readonly SemaphoreSlim m_lock = new(1, 1);
-        protected readonly Queue<DbMessage> m_dbqueue;
 
         public virtual ParsedResultType ParsedResult
         {
@@ -266,36 +255,6 @@ namespace Duplicati.Library.Main
             }
         }
 
-        /// <summary>
-        /// Flushes the log messages to the database.
-        /// </summary>
-        /// <param name="db">The database to flush the log messages to.</param>
-        /// <param name="token">The cancellation token to use.</param>
-        /// <returns>A task that completes when the log messages have been flushed.</returns>
-        public async Task FlushLogAsync(LocalDatabase db, CancellationToken token)
-        {
-            if (m_parent != null)
-                await m_parent.FlushLogAsync(db, token).ConfigureAwait(false);
-            else
-            {
-                await m_lock.WaitAsync(token).ConfigureAwait(false);
-                try
-                {
-                    while (m_dbqueue.Count > 0)
-                    {
-                        var el = m_dbqueue.Dequeue();
-                        await db
-                            .LogMessageAsync(el.Type, el.Message, el.Exception, token)
-                            .ConfigureAwait(false);
-                    }
-                }
-                finally
-                {
-                    m_lock.Release();
-                }
-            }
-        }
-
         private static bool m_is_reporting = false;
 
         public void AddBackendEvent(BackendActionType action, BackendEventType type, string path, long size, bool updateProgress = true)
@@ -341,7 +300,7 @@ namespace Duplicati.Library.Main
 
         // ReSharper disable once UnusedMember.Global
         // This is referenced in the logs.
-        public int MessagesActualLength { get { return Messages == null ? 0 : Messages.Count(); } }
+        public int MessagesActualLength { get { return m_messages == null ? 0 : (int)Math.Min(int.MaxValue, m_messages.Count); } }
 
         [System.Text.Json.Serialization.JsonIgnore]
         [Newtonsoft.Json.JsonIgnore]
@@ -349,7 +308,7 @@ namespace Duplicati.Library.Main
 
         // ReSharper disable once UnusedMember.Global
         // This is referenced in the logs.
-        public int WarningsActualLength { get { return Warnings == null ? 0 : Warnings.Count(); } }
+        public int WarningsActualLength { get { return m_warnings == null ? 0 : (int)Math.Min(int.MaxValue, m_warnings.Count); } }
 
         [System.Text.Json.Serialization.JsonIgnore]
         [Newtonsoft.Json.JsonIgnore]
@@ -357,7 +316,7 @@ namespace Duplicati.Library.Main
 
         // ReSharper disable once UnusedMember.Global
         // This is referenced in the logs.
-        public int ErrorsActualLength { get { return Errors == null ? 0 : Errors.Count(); } }
+        public int ErrorsActualLength { get { return m_errors == null ? 0 : (int)Math.Min(int.MaxValue, m_errors.Count); } }
 
         [JsonProperty(PropertyName = "Messages")]
         [JsonPropertyName("Messages")]
@@ -394,7 +353,6 @@ namespace Duplicati.Library.Main
             m_warnings = new Library.Utility.FileBackedStringList();
             m_errors = new Library.Utility.FileBackedStringList();
             m_retryAttempts = new Library.Utility.FileBackedStringList();
-            m_dbqueue = new Queue<DbMessage>();
             m_backendStatistics = new BackendWriter(this);
             m_callerThread = System.Threading.Thread.CurrentThread;
             m_backendProgressUpdater = new BackendProgressUpdater();

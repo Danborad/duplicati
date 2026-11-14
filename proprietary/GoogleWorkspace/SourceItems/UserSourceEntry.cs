@@ -7,9 +7,24 @@ using User = Google.Apis.Admin.Directory.directory_v1.Data.User;
 
 namespace Duplicati.Proprietary.GoogleWorkspace.SourceItems;
 
-internal class UserSourceEntry(SourceProvider provider, string parentPath, User user)
-    : MetaEntryBase(Util.AppendDirSeparator(SystemIO.IO_OS.PathCombine(parentPath, user.PrimaryEmail)), null, null)
+/// <param name="provider">The source provider</param>
+/// <param name="parentPath">The path of the folder the user folder is placed in</param>
+/// <param name="usersRootPath">The path of the Users folder, which the seat count is kept under</param>
+/// <param name="user">The user</param>
+/// <param name="changeTrackingUserScope">The scope the change tracking state of the user is stored under</param>
+internal class UserSourceEntry(SourceProvider provider, string parentPath, string usersRootPath, User user, string changeTrackingUserScope)
+    : MetaEntryBase(Util.AppendDirSeparator(SystemIO.IO_OS.PathCombine(parentPath, EntryName(provider, user))), null, null)
 {
+    /// <summary>
+    /// The name of the entry of a user: the primary email address, or the user id
+    /// when the provider is set up to use ids. The id stays the same when the address changes.
+    /// </summary>
+    /// <param name="provider">The source provider</param>
+    /// <param name="user">The user</param>
+    /// <returns>The entry name</returns>
+    internal static string EntryName(SourceProvider provider, User user)
+        => provider.Options.UseUserIdsInPaths ? user.Id : user.PrimaryEmail;
+
     /// <summary>
     /// The primary email of the user, which is the identifier the user-scoped APIs accept.
     /// </summary>
@@ -27,8 +42,11 @@ internal class UserSourceEntry(SourceProvider provider, string parentPath, User 
         // Suspended and archived accounts are still backed up, but do not consume a seat.
         var countsAsSeat = SourceProvider.UserCountsAsSeat(user);
 
-        if (!provider.LicenseApprovedForEntry(parentPath, GoogleRootType.Users, user.Id, true, countsAsSeat))
+        if (!provider.LicenseApprovedForEntry(usersRootPath, GoogleRootType.Users, user.Id, true, countsAsSeat))
             yield break;
+
+        // The entries below read the scope when they build their change tracking keys
+        provider.SetChangeTrackingUserScope(userId, changeTrackingUserScope);
 
         if (cancellationToken.IsCancellationRequested)
             yield break;
@@ -64,6 +82,9 @@ internal class UserSourceEntry(SourceProvider provider, string parentPath, User 
                 { "gsuite:Type", SourceItemType.User.ToString() },
                 { "gsuite:Name", userId },
                 { "gsuite:Id", userId },
+                { "gsuite:UserId", userId },
+                { "gsuite:DirectoryId", user.Id },
+                { "gsuite:OrgUnitPath", user.OrgUnitPath },
                 { "gsuite:Suspended", user.Suspended?.ToString() },
                 { "gsuite:Archived", user.Archived?.ToString() },
                 { "gsuite:Classification", SourceProvider.ClassifyUser(user).ToString() }

@@ -126,6 +126,8 @@ public class SourceProviderOptionValidationTests : BasicSetupHelper
         ];
         public string MountedPath => _mountPoint;
         public bool NeedsStoredMetadata => false;
+        /// <inheritdoc />
+        public bool NeedsCaseSensitiveFilters => false;
 
         public Task InitializeAsync(CancellationToken cancellationToken)
             => Task.CompletedTask;
@@ -206,7 +208,7 @@ public class SourceProviderOptionValidationTests : BasicSetupHelper
 
         public string TargetDestination => Inner.TargetDestination;
         public Task Initialize(CancellationToken cancel) => Inner.Initialize(cancel);
-        public Task Finalize(Action<double>? progressCallback, CancellationToken cancel) => Inner.Finalize(progressCallback, cancel);
+        public Task Finalize(Action<double>? progressCallback, bool isComplete, CancellationToken cancel) => Inner.Finalize(progressCallback, isComplete, cancel);
         public Task Test(CancellationToken cancellationToken) => Inner.Test(cancellationToken);
         public Task<bool> CreateFolderIfNotExists(string path, CancellationToken cancel) => Inner.CreateFolderIfNotExists(path, cancel);
         public Task<bool> FileExists(string path, CancellationToken cancel) => Inner.FileExists(path, cancel);

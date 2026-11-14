@@ -91,7 +91,7 @@ namespace Duplicati.Library.Main.Operation.Backup
             {
                 var fileTime = await FilesetVolumeWriter.ProbeUnusedFilenameNameAsync(database, options, incompleteSet.Value, taskreader.ProgressToken).ConfigureAwait(false);
                 syntheticFilelistTime = fileTime;
-                fsw = new FilesetVolumeWriter(options, fileTime);
+                fsw = new FilesetVolumeWriter(options, fileTime) { IsRemoteNameTaken = FilesetVolumeWriter.NameTakenIn(database) };
                 fsw.VolumeID = await database.RegisterRemoteVolumeAsync(fsw.RemoteFilename, RemoteVolumeType.Files, RemoteVolumeState.Temporary, taskreader.ProgressToken).ConfigureAwait(false);
 
                 if (!string.IsNullOrEmpty(options.ControlFiles))
@@ -103,7 +103,10 @@ namespace Duplicati.Library.Main.Operation.Backup
                 fsw.CreateFilesetFile(false);
                 var newFilesetID = await database.CreateFilesetAsync(fsw.VolumeID, fileTime, taskreader.ProgressToken).ConfigureAwait(false);
                 await database.LinkFilesetToVolumeAsync(newFilesetID, fsw.VolumeID, taskreader.ProgressToken).ConfigureAwait(false);
-                await database.AppendFilesFromPreviousSetAsync(null, newFilesetID, prevId, fileTime, taskreader.ProgressToken).ConfigureAwait(false);
+                // The files the interrupted backup got done, then the files of the previous backup it did not get to
+                await database.AppendFilesFromPreviousSetAsync(null, newFilesetID, incompleteSet.Key, fileTime, taskreader.ProgressToken).ConfigureAwait(false);
+                if (prevId >= 0)
+                    await database.AppendFilesFromPreviousSetAsync(null, newFilesetID, prevId, fileTime, taskreader.ProgressToken).ConfigureAwait(false);
 
                 await database.WriteFilesetAsync(fsw, newFilesetID, taskreader.ProgressToken).ConfigureAwait(false);
 

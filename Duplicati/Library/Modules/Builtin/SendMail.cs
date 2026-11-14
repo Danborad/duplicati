@@ -73,6 +73,10 @@ namespace Duplicati.Library.Modules.Builtin
         /// </summary>
         private const string OPTION_BODY = "send-mail-body";
         /// <summary>
+        /// Option used to send the mail body as HTML
+        /// </summary>
+        private const string OPTION_BODY_HTML = "send-mail-body-html";
+        /// <summary>
         /// Option used to specify mail level
         /// </summary>
         private const string OPTION_SENDLEVEL = "send-mail-level";
@@ -105,6 +109,18 @@ namespace Duplicati.Library.Modules.Builtin
         /// Option used to set the maximum number of log lines
         /// </summary>
         private const string OPTION_MAX_LOG_LINES = "send-mail-max-log-lines";
+        /// <summary>
+        /// Option used to accept any server certificate
+        /// </summary>
+        private const string OPTION_ACCEPT_ANY_CERTIFICATE = "send-mail-accept-any-ssl-certificate";
+        /// <summary>
+        /// Option used to accept server certificates with the given hashes
+        /// </summary>
+        private const string OPTION_ACCEPT_SPECIFIED_CERTIFICATE = "send-mail-accept-specified-ssl-hash";
+        /// <summary>
+        /// Option used to ignore certificate revocation check failures
+        /// </summary>
+        private const string OPTION_IGNORE_REVOCATION_FAILURE = "send-mail-ignore-revocation-failure";
         #endregion
 
         #region Option defaults
@@ -131,6 +147,22 @@ namespace Duplicati.Library.Modules.Builtin
         /// The mail sender
         /// </summary>
         private string? m_from;
+        /// <summary>
+        /// Whether to accept any server certificate
+        /// </summary>
+        private bool m_acceptAnyCertificate;
+        /// <summary>
+        /// The hashes of the server certificates to accept
+        /// </summary>
+        private string[]? m_acceptSpecificCertificates;
+        /// <summary>
+        /// Whether to ignore certificate revocation check failures
+        /// </summary>
+        private bool m_ignoreRevocationFailure;
+        /// <summary>
+        /// Whether the body is sent as HTML
+        /// </summary>
+        private bool m_bodyHtml;
         /// <summary>
         /// The mail recipient
         /// </summary>
@@ -170,9 +202,13 @@ namespace Duplicati.Library.Modules.Builtin
             new CommandLineArgument(OPTION_SENDER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSenderShort, Strings.SendMail.OptionSenderLong, DEFAULT_SENDER),
             new CommandLineArgument(OPTION_SUBJECT, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSubjectShort, Strings.SendMail.OptionSubjectLong(OPTION_BODY), DEFAULT_SUBJECT),
             new CommandLineArgument(OPTION_BODY, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionBodyShort, Strings.SendMail.OptionBodyLong, DEFAULT_BODY),
+            new CommandLineArgument(OPTION_BODY_HTML, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.OptionBodyHtmlShort, Strings.SendMail.OptionBodyHtmlLong(OPTION_BODY), "false"),
             new CommandLineArgument(OPTION_SERVER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionServerShort, Strings.SendMail.OptionServerLong),
             new CommandLineArgument(OPTION_USERNAME, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionUsernameShort, Strings.SendMail.OptionUsernameLong),
             new CommandLineArgument(OPTION_PASSWORD, CommandLineArgument.ArgumentType.Password, Strings.SendMail.OptionPasswordShort, Strings.SendMail.OptionPasswordLong),
+            new CommandLineArgument(OPTION_ACCEPT_ANY_CERTIFICATE, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.AcceptAnyCertificateShort, Strings.SendMail.AcceptAnyCertificateLong(OPTION_ACCEPT_SPECIFIED_CERTIFICATE), "false"),
+            new CommandLineArgument(OPTION_ACCEPT_SPECIFIED_CERTIFICATE, CommandLineArgument.ArgumentType.String, Strings.SendMail.AcceptSpecifiedCertificateShort, Strings.SendMail.AcceptSpecifiedCertificateLong),
+            new CommandLineArgument(OPTION_IGNORE_REVOCATION_FAILURE, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.IgnoreRevocationFailureShort, Strings.SendMail.IgnoreRevocationFailureLong, "false"),
             new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSendlevelShort, Strings.SendMail.OptionSendlevelLong(ParsedResultType.Success.ToString(), ParsedResultType.Warning.ToString(), ParsedResultType.Error.ToString(), ParsedResultType.Fatal.ToString(), "All"), DEFAULT_LEVEL, null, Enum.GetNames(typeof(ParsedResultType)).Union(new string [] { "All" }).ToArray()),
             new CommandLineArgument(OPTION_SENDALL, CommandLineArgument.ArgumentType.Boolean, Strings.SendHttpMessage.SendhttpanyoperationShort, Strings.SendHttpMessage.SendhttpanyoperationLong),
             new CommandLineArgument(OPTION_SEND_OPERATIONS, CommandLineArgument.ArgumentType.Flags, Strings.ReportHelper.OptionOperationsShort, Strings.ReportHelper.OptionOperationsLong, DEFAULT_OPERATIONS, null, ValidOperationNames),
@@ -215,8 +251,19 @@ namespace Duplicati.Library.Modules.Builtin
             if (string.IsNullOrEmpty(m_from))
                 m_from = DEFAULT_SENDER;
 
+            // As ParseBoolOption, where an option given without a value is set
+            m_acceptAnyCertificate = commandlineOptions.TryGetValue(OPTION_ACCEPT_ANY_CERTIFICATE, out var acceptAny) && Utility.Utility.ParseBool(acceptAny, true);
+            m_acceptSpecificCertificates = commandlineOptions.TryGetValue(OPTION_ACCEPT_SPECIFIED_CERTIFICATE, out var hashes) && !string.IsNullOrWhiteSpace(hashes)
+                ? hashes.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                : null;
+            m_ignoreRevocationFailure = commandlineOptions.TryGetValue(OPTION_IGNORE_REVOCATION_FAILURE, out var ignoreRevocation) && Utility.Utility.ParseBool(ignoreRevocation, true);
+            m_bodyHtml = commandlineOptions.TryGetValue(OPTION_BODY_HTML, out var bodyHtml) && Utility.Utility.ParseBool(bodyHtml, true);
+
             return true;
         }
+
+        /// <inheritdoc/>
+        protected override bool BodyIsHtml => m_bodyHtml;
 
         #endregion
 
@@ -256,7 +303,7 @@ namespace Duplicati.Library.Modules.Builtin
                 message.From.Add(mailbox);
 
             message.Subject = subject;
-            message.Body = new TextPart("plain") { Text = body, ContentTransferEncoding = ContentEncoding.EightBit };
+            message.Body = new TextPart(m_bodyHtml ? "html" : "plain") { Text = body, ContentTransferEncoding = ContentEncoding.EightBit };
 
             List<string>? servers = null;
             if (string.IsNullOrEmpty(m_server))
@@ -294,6 +341,14 @@ namespace Duplicati.Library.Modules.Builtin
                             using (var client = new SmtpClient(new MailKit.ProtocolLogger(ms)))
                             {
                                 client.Timeout = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
+
+                                // Without any of the certificate options, MailKit validates the certificate as before
+                                if (m_acceptAnyCertificate || m_acceptSpecificCertificates != null || m_ignoreRevocationFailure)
+                                {
+                                    client.ServerCertificateValidationCallback = new Utility.SslCertificateValidator(m_acceptAnyCertificate, m_acceptSpecificCertificates, m_ignoreRevocationFailure).ValidateServerCertificate;
+                                    // The revocation status is then fetched by the validator, if at all
+                                    client.CheckCertificateRevocation = false;
+                                }
 
                                 // Backward compatibility fix for setup prior to using MailKit
                                 var uri = new System.Uri(server);

@@ -80,6 +80,11 @@ public class ControllerRpcProxy : IController, IDisposable, IControllerRpcCallba
     /// </summary>
     public static IReadOnlyCollection<int> ActiveProcessIds => _activeProcessIds.Keys.ToArray();
     private readonly IMessageSink _messageSink;
+    /// <summary>
+    /// The change list provider set by the host; it stays in this process and is
+    /// invoked when the controller process asks for the change list
+    /// </summary>
+    private IChangeListProvider? _changeListProvider;
     private readonly string _backendUrl;
     private readonly Dictionary<string, string?> _options;
 
@@ -233,6 +238,10 @@ public class ControllerRpcProxy : IController, IDisposable, IControllerRpcCallba
         // because it takes precedence over the portable-mode default.
         var serverDatafolderEnvName = $"{Library.AutoUpdater.AutoUpdateSettings.AppName}__{Library.AutoUpdater.DataFolderManager.SERVER_DATAFOLDER_OPTION.Replace('-', '_')}".ToUpperInvariant();
         psi.Environment[serverDatafolderEnvName] = Library.AutoUpdater.DataFolderManager.GetDataFolder(Library.AutoUpdater.DataFolderManager.AccessMode.ProbeOnly);
+
+        // The controller runs the report modules, so it reports the executable
+        // the user started rather than the commandline engine it runs in
+        psi.Environment[Library.AutoUpdater.PackageHelper.ENTRY_ASSEMBLY_ENV_NAME] = Library.AutoUpdater.PackageHelper.EntryAssemblyName;
 
         var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         process.Exited += OnProcessExited;
@@ -570,6 +579,19 @@ public class ControllerRpcProxy : IController, IDisposable, IControllerRpcCallba
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Called by the RPC server when the backup asks for the change list.
+    /// The provider runs in this process; only the file path and the tokens cross the boundary.
+    /// </summary>
+    public async Task<ChangeListHandoff?> OnDrainChangeListAsync(DateTime referenceTimeUtc)
+    {
+        var provider = _changeListProvider;
+        if (provider == null)
+            return null;
+
+        return await provider.DrainChangeListAsync(referenceTimeUtc, _progressPollCancellation.Token).ConfigureAwait(false);
+    }
+
     #endregion
 
     #region IController Implementation
@@ -613,6 +635,18 @@ public class ControllerRpcProxy : IController, IDisposable, IControllerRpcCallba
     /// <inheritdoc />
     public async Task<ISyncResults> SyncAsync(string[] sources, IFilter? filter)
         => await InvokeAsync<ISyncResults>(nameof(IController.SyncAsync), sources, filter).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public async Task<IListFilesetResults> ListSyncVersionsAsync()
+        => await InvokeAsync<IListFilesetResults>(nameof(IController.ListSyncVersionsAsync)).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public async Task<IListFolderResults> ListSyncFolderAsync(string[] sourcePaths, string[]? folders, long offset, long limit)
+        => await InvokeAsync<IListFolderResults>(nameof(IController.ListSyncFolderAsync), sourcePaths, folders, offset, limit).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public async Task<IRestoreResults> SyncRestoreAsync(string[] sourcePaths, string[]? paths)
+        => await InvokeAsync<IRestoreResults>(nameof(IController.SyncRestoreAsync), sourcePaths, paths).ConfigureAwait(false);
 
     /// <inheritdoc />
     public async Task<ITestResults> TestAsync(long samples = 1)
@@ -779,6 +813,16 @@ public class ControllerRpcProxy : IController, IDisposable, IControllerRpcCallba
     {
         if (_rpc != null)
             await InvokeAsync(nameof(IController.SetSecretProviderAsync), secretProvider).WaitAsync(ControlCallTimeout).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task SetChangeListProviderAsync(IChangeListProvider? changeListProvider)
+    {
+        // The provider object never crosses the boundary; the controller process
+        // is told that one exists and calls back for the list when it needs it
+        _changeListProvider = changeListProvider;
+        if (_rpc != null)
+            await _rpc.InvokeAsync(nameof(ControllerRpcServer.EnableChangeListProviderAsync), changeListProvider != null).ConfigureAwait(false);
     }
 
     /// <inheritdoc />

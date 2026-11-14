@@ -572,17 +572,12 @@ namespace Duplicati.Library.Main.Database.Local
                     ""H"".""Index"",
                     ""H"".""BlockID""
                 FROM ({selectAllBlocksetEntries}) H
-                WHERE (
-                        ""H"".""BlocksetID""
-                        || ':'
-                        || ""H"".""Index""
-                    ) NOT IN (
-                    SELECT (
-                        ""ExistingBlocksetEntries"".""BlocksetID""
-                        || ':'
-                        || ""ExistingBlocksetEntries"".""Index""
-                    )
+                WHERE NOT EXISTS (
+                    SELECT 1
                     FROM ""BlocksetEntry"" ""ExistingBlocksetEntries""
+                    WHERE
+                        ""ExistingBlocksetEntries"".""BlocksetID"" = ""H"".""BlocksetID""
+                        AND ""ExistingBlocksetEntries"".""Index"" = ""H"".""Index""
                 )
             ";
 
@@ -1334,6 +1329,48 @@ namespace Duplicati.Library.Main.Database.Local
                 );
 
                 DROP TABLE ""{tablename}"";
+
+                -- An index file that only describes the volumes removed below holds nothing
+                -- else, and left in place it makes every recreate report those volumes as
+                -- missing again (#4507). The next listing deletes it from the destination.
+                UPDATE ""RemoteVolume""
+                SET ""State"" = '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeState.Deleting)}'
+                WHERE
+                    ""Type"" = '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeType.Index)}'
+                    AND ""State"" IN (
+                        '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeState.Uploaded)}',
+                        '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeState.Verified)}'
+                    )
+                    AND ""ID"" IN (
+                        SELECT ""IndexVolumeID""
+                        FROM ""IndexBlockLink""
+                        WHERE ""BlockVolumeID"" IN (
+                            SELECT ""ID""
+                            FROM ""RemoteVolume""
+                            WHERE
+                                ""Type"" = '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeType.Blocks)}'
+                                AND ""State"" = '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeState.Temporary)}'
+                                AND ""ID"" NOT IN (
+                                    SELECT DISTINCT ""VolumeID""
+                                    FROM ""Block""
+                                )
+                        )
+                    )
+                    AND ""ID"" NOT IN (
+                        SELECT ""IndexVolumeID""
+                        FROM ""IndexBlockLink""
+                        WHERE ""BlockVolumeID"" NOT IN (
+                            SELECT ""ID""
+                            FROM ""RemoteVolume""
+                            WHERE
+                                ""Type"" = '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeType.Blocks)}'
+                                AND ""State"" = '{Library.Utility.Utility.FormatInvariantValue(RemoteVolumeState.Temporary)}'
+                                AND ""ID"" NOT IN (
+                                    SELECT DISTINCT ""VolumeID""
+                                    FROM ""Block""
+                                )
+                        )
+                    );
 
                 DELETE FROM ""IndexBlockLink""
                 WHERE ""BlockVolumeID"" IN (
